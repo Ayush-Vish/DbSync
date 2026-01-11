@@ -1,169 +1,230 @@
-    #include <iostream>
-    #include <vector>
-    #include <string>
-    #include <string_view>
-    #include <unordered_map>
-    #include <mutex>
-    #include <shared_mutex>
-    #include <optional>
-    #include <netinet/in.h>
-    #include <unistd.h>
-    #include <cstring>
-    #include <charconv>
-    const int PORT = 6379;
-    // well this is the class in which is the main Engine of the DBSync server
-    class DbSyncEngine {
-    private:
-        struct Shard{
-            std::unordered_map<std::string,std::string> data;
-            std::shared_mutex mtx; // shared_mutex lets many people read at once, but only one write
-        };
-        std::vector<Shard> shards; // we split the data into multiple Shards.
-        int shard_count;
+#include <iostream>
+#include <vector>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <mutex>
+#include <shared_mutex>
+#include <optional>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <cstring>
+#include <charconv>
+#include <thread>
+#include <queue>
+#include <condition_variable>
+#include <functional>
+const int PORT = 6379;
+// well this is the class in which is the main Engine of the DBSync server
 
-        int get_shard_index (const  std::string_view&key) {
-            return std::hash<std::string_view>{}(key) % shard_count; // -> returns the index of the shard for a given key
-            // What if it gives the same index for every key? -> then all keys go to the same shard
-        }
-    public:
-        DbSyncEngine(int num_shards) : shard_count(num_shards), shards(num_shards) {}
-
-        // The Set Operation
-        void set(const std::string& key, const std::string& value) {
-            auto &s = shards[get_shard_index(key)];
-            std::unique_lock lock(s.mtx);
-            s.data[std::string(key)] = std::string(value);
-        }
-        // The Get Operation
-        std::optional<std::string> get (const std::string&key   ) {
-            auto &s = shards[get_shard_index(key)];
-            std::shared_lock lock(s.mtx);
-            auto it = s.data.find(key);
-            if(it != s.data.end()) {
-                return it->second;
-            }
-            return std::nullopt;
-        }
-
-        bool del(std::string_view key) {
-            auto& s = shards[get_shard_index(key)];
-            std::unique_lock lock(s.mtx); // we need to lock the shard to delete safely
-            return s.data.erase(std::string(key)) > 0;
-        }
+class DbSyncEngine {
+private:
+    struct Shard{
+        std::unordered_map<std::string,std::string> data;
+        std::shared_mutex mtx; // shared_mutex lets many people read at once, but only one write
     };
+    std::vector<Shard> shards; // we split the data into multiple Shards.
+    int shard_count;
 
-
-
-
-
-    struct Command{
-        std::string_view type; // used string  view to avoid copying strings , Ex: SET, GET
-        std::vector<std::string_view> args; // Ex: SET key value -> args = [key,value]
-    };
-
-    class RespParser {
-    public:
-        static Command parse(std::string_view buffer) {
-            // Redis commands start with '*' if they are an array (which most are)
-            if (buffer.empty() || buffer[0] != '*') return {"UNKNOWN", {}};
-
-            size_t pos = 0;
-            // This helper lambda finds the next line ending (\r\n)
-            auto read_line = [&]() -> std::string_view {
-                size_t start = pos;
-                size_t end = buffer.find("\r\n", pos);
-                if (end == std::string_view::npos) return "";
-                pos = end + 2;
-                return buffer.substr(start, end - start);
-            };
-
-            std::string_view header = read_line(); // This is the "*3" line
-            int num_args = 0;
-            // Extracting the number after the '*'
-            std::from_chars(header.data() + 1, header.data() + header.size(), num_args);
-
-            Command cmd;
-            for (int i = 0; i < num_args; ++i) {
-                read_line(); // Skip the "$3" (length) lines, we don't strictly need them for this simple version
-                std::string_view arg = read_line(); // This is the actual word (SET, key, or value)
-                if (i == 0) cmd.type = arg;
-                else cmd.args.push_back(arg);
-            }
-            return cmd;
-        }
-    };
-
-    int main (){
-        DbSyncEngine engine(16); // create an engine with 16 shards
-        int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (server_fd < 0) {
-            perror("socket");
-            return 1;
-        }
-
-        int opt = 1;
-        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(PORT);
-        addr.sin_addr.s_addr = INADDR_ANY;
-
-        if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            perror("bind");
-            return 1;
-        }
-
-        if (listen(server_fd, 128) < 0) {
-            perror("listen");
-            return 1;
-        }
-
-        std::cout << "DBSync server is listening on port " << PORT << "..." << std::endl;
-
-        while(true) {
-            int client_fd = accept(server_fd, nullptr, nullptr);
-            std::cout << "Accepted connection on socket: " << client_fd << std::endl;
-            if(client_fd < 0) {
-                std::cerr << "Accept failed" << std::endl;
-                continue;
-            }
-            while(true) {
-
-                char buffer[1024] = {0};
-                ssize_t bytes_read = read(client_fd, buffer, 1024);
-                if(bytes_read <= 0) {
-                    close(client_fd);
-                    break;;
-                }
-                std::string_view raw_request(buffer, bytes_read);
-                Command cmd = RespParser::parse(raw_request);
-                if(cmd.type == "SET" && cmd.args.size() >= 2 ) {
-                    engine.set(std::string(cmd.args[0]), std::string(cmd.args[1]));
-                    const char *response = "+OK\r\n";
-                    send(client_fd, response, strlen(response), 0);
-                }else if( cmd.type == "GET" && cmd.args.size() >= 1) {
-                    auto val = engine.get(std::string(cmd.args[0]));
-                    if(val){
-                        std::string res = "$" + std::to_string(val->size()) + "\r\n" + *val + "\r\n";
-                        send(client_fd, res.c_str(), res.size(), 0);
-                    }else{
-                        const char *response = "$-1\r\n"; // Null bulk string
-                        send(client_fd, response, strlen(response), 0);
-                    }
-                }else if( cmd.type == "DEL" && cmd.args.size() >= 1) {
-                    bool deleted = engine.del(cmd.args[0]);
-                    std::string res = ":" + std::to_string(deleted ? 1 : 0) + "\r\n";
-                    send(client_fd, res.c_str(), res.size(), 0);
-                }else{
-                    const char *response = "-ERR unknown command\r\n";
-                    send(client_fd, response, strlen(response), 0);
-                }
-            }
-            close(client_fd);
-
-        }
-        close(server_fd);
-        return 0;
-        
+    int get_shard_index (const  std::string_view&key) {
+        return std::hash<std::string_view>{}(key) % shard_count; // -> returns the index of the shard for a given key
+        // What if it gives the same index for every key? -> then all keys go to the same shard
     }
+public:
+    DbSyncEngine(int num_shards) : shard_count(num_shards), shards(num_shards) {}
+
+    // The Set Operation
+
+    void set(const std::string& key, const std::string& value) {
+        auto &s = shards[get_shard_index(key)];
+        std::unique_lock lock(s.mtx);
+        s.data[std::string(key)] = std::string(value);
+    }
+    // The Get Operation
+    std::optional<std::string> get (const std::string&key   ) {
+        auto &s = shards[get_shard_index(key)];
+        std::shared_lock lock(s.mtx);
+        auto it = s.data.find(key);
+        if(it != s.data.end()) {
+            return it->second;
+        }
+        return std::nullopt;
+    }
+
+    bool del(std::string_view key) {
+        auto& s = shards[get_shard_index(key)];
+        std::unique_lock lock(s.mtx); // we need to lock the shard to delete safely
+        return s.data.erase(std::string(key)) > 0;
+    }
+};
+
+
+
+
+
+struct Command{
+    std::string_view type; // used string  view to avoid copying strings , Ex: SET, GET
+    std::vector<std::string_view> args; // Ex: SET key value -> args = [key,value]
+};
+
+class RespParser {
+public:
+    static Command parse(std::string_view buffer) {
+        // Redis commands start with '*' if they are an array (which most are)
+        if (buffer.empty() || buffer[0] != '*') return {"UNKNOWN", {}};
+
+        size_t pos = 0;
+        // This helper lambda finds the next line ending (\r\n)
+        auto read_line = [&]() -> std::string_view {
+            size_t start = pos;
+            size_t end = buffer.find("\r\n", pos);
+            if (end == std::string_view::npos) return "";
+            pos = end + 2;
+            return buffer.substr(start, end - start);
+        };
+
+        std::string_view header = read_line(); // This is the "*3" line
+        int num_args = 0;
+        // Extracting the number after the '*'
+        std::from_chars(header.data() + 1, header.data() + header.size(), num_args);
+
+        Command cmd;
+        for (int i = 0; i < num_args; ++i) {
+            read_line(); // Skip the "$3" (length) lines, we don't strictly need them for this simple version
+            std::string_view arg = read_line(); // This is the actual word (SET, key, or value)
+            if (i == 0) cmd.type = arg;
+            else cmd.args.push_back(arg);
+        }
+        return cmd;
+    }
+};
+
+
+
+class ThreadPool {
+private:
+std::vector<std::thread> workers; // the actual threads waiting for work
+    std::queue<std::function<void()>> tasks; // a queue of clients waiting to be handled
+    std::mutex queue_mtx; // to make sure two threads don't grab the same client
+    std::condition_variable cv; // to wake up threads when a new client arrives
+    bool stop = false;
+
+public:
+    ThreadPool(size_t num_threads) {
+        for(size_t i = 0; i < num_threads; ++i) {
+            workers.emplace_back([this]{
+                // worker thread function
+                while(true) {
+                    std::function<void()> task ;
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mtx);
+                        cv.wait(lock, [this] { return stop || !tasks.empty(); });
+                        if (stop && tasks.empty()) return;
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+                    task();
+                }
+
+
+            });
+        }
+    }
+    void enqueue(std::function<void()> task) {
+        {
+            std::unique_lock<std::mutex> lock(queue_mtx);
+            tasks.push(std::move(task));
+        }
+        cv.notify_one(); // wake up one idle worker
+    }
+    ~ThreadPool() {
+        { std::unique_lock<std::mutex> lock(queue_mtx); stop = true; }
+        cv.notify_all();
+        for (auto &w : workers) w.join();
+    }
+
+};
+
+void handle_client(int client_fd, DbSyncEngine &engine) {
+    while(true) {
+
+        char buffer[1024] = {0};
+        ssize_t bytes_read = read(client_fd, buffer, 1024);
+        if(bytes_read <= 0) {
+            close(client_fd);
+            break;;
+        }
+        std::string_view raw_request(buffer, bytes_read);
+        Command cmd = RespParser::parse(raw_request);
+        if(cmd.type == "SET" && cmd.args.size() >= 2 ) {
+            engine.set(std::string(cmd.args[0]), std::string(cmd.args[1]));
+            const char *response = "+OK\r\n";
+            send(client_fd, response, strlen(response), 0);
+        }else if( cmd.type == "GET" && cmd.args.size() >= 1) {
+            auto val = engine.get(std::string(cmd.args[0]));
+            if(val){
+                std::string res = "$" + std::to_string(val->size()) + "\r\n" + *val + "\r\n";
+                send(client_fd, res.c_str(), res.size(), 0);
+            }else{
+                const char *response = "$-1\r\n"; // Null bulk string
+                send(client_fd, response, strlen(response), 0);
+            }
+        }else if( cmd.type == "DEL" && cmd.args.size() >= 1) {
+            bool deleted = engine.del(cmd.args[0]);
+            std::string res = ":" + std::to_string(deleted ? 1 : 0) + "\r\n";
+            send(client_fd, res.c_str(), res.size(), 0);
+        }else{
+            const char *response = "-ERR unknown command\r\n";
+            send(client_fd, response, strlen(response), 0);
+        }
+    }
+    close(client_fd);
+}
+    
+
+
+int main (){
+    DbSyncEngine engine(16); // create an engine with 16 
+    ThreadPool pool(std::thread::hardware_concurrency());
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("socket");   
+        return 1;
+    }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        return 1;
+    }
+
+    if (listen(server_fd, 128) < 0) {
+        perror("listen");
+        return 1;
+    }
+
+    std::cout << "DBSync server is listening on port " << PORT << "..." << std::endl;
+
+    while(true) {
+        int client_fd = accept(server_fd, nullptr, nullptr);
+        std::cout << "Accepted connection on socket: " << client_fd << std::endl;
+        if(client_fd < 0) {
+            std::cerr << "Accept failed" << std::endl;
+            continue;
+        }
+        pool.enqueue([client_fd, &engine] {
+            handle_client(client_fd, engine);
+        });
+
+    }
+    close(server_fd);
+    return 0;
+    
+}
