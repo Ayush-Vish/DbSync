@@ -99,3 +99,10 @@ redis-cli -p 6379 SET mykey "Hello DbSync"
 redis-cli -p 6379 GET mykey
 
 ```
+
+
+
+```
+sudo apt install liburing-dev
+
+```

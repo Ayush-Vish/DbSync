@@ -14,92 +14,48 @@
 #include <queue>
 #include <condition_variable>
 #include <functional>
+#include <liburing.h>
+
+#include "../include/dbsync_engine.hpp"
+#include "../include/resp_parser.hpp"
+#include "../include/debug.hpp"
 const int PORT = 6379;
-// well this is the class in which is the main Engine of the DBSync server
+const int QUEUE_DEPTH = 4096; // size of the ring for kernel requests
 
-class DbSyncEngine {
-private:
-    struct Shard{
-        std::unordered_map<std::string,std::string> data;
-        std::shared_mutex mtx; // shared_mutex lets many people read at once, but only one write
-    };
-    std::vector<Shard> shards; // we split the data into multiple Shards.
-    int shard_count;
-
-    int get_shard_index (const  std::string_view&key) {
-        return std::hash<std::string_view>{}(key) % shard_count; // -> returns the index of the shard for a given key
-        // What if it gives the same index for every key? -> then all keys go to the same shard
-    }
-public:
-    DbSyncEngine(int num_shards) : shard_count(num_shards), shards(num_shards) {}
-
-    // The Set Operation
-
-    void set(const std::string& key, const std::string& value) {
-        auto &s = shards[get_shard_index(key)];
-        std::unique_lock lock(s.mtx);
-        s.data[std::string(key)] = std::string(value);
-    }
-    // The Get Operation
-    std::optional<std::string> get (const std::string&key   ) {
-        auto &s = shards[get_shard_index(key)];
-        std::shared_lock lock(s.mtx);
-        auto it = s.data.find(key);
-        if(it != s.data.end()) {
-            return it->second;
-        }
-        return std::nullopt;
-    }
-
-    bool del(std::string_view key) {
-        auto& s = shards[get_shard_index(key)];
-        std::unique_lock lock(s.mtx); // we need to lock the shard to delete safely
-        return s.data.erase(std::string(key)) > 0;
-    }
+enum class OpType{
+    ACCEPT, READ, WRITE
 };
 
-
-
-
-
-struct Command{
-    std::string_view type; // used string  view to avoid copying strings , Ex: SET, GET
-    std::vector<std::string_view> args; // Ex: SET key value -> args = [key,value]
+struct Connection {
+    int fd;
+    OpType type;
+    char buffer[4096]; // data lands here directly from the kernel
+    std::string response_data; // keeps the string alive while the kernel is sending it
 };
 
-class RespParser {
-public:
-    static Command parse(std::string_view buffer) {
-        // Redis commands start with '*' if they are an array (which most are)
-        if (buffer.empty() || buffer[0] != '*') return {"UNKNOWN", {}};
+void submit_read(struct io_uring *ring, Connection *conn) {
+    conn->type = OpType::READ;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_read(sqe, conn->fd, conn->buffer, sizeof(conn->buffer), 0);
+    io_uring_sqe_set_data(sqe, conn); // tag this request so we find it in completion
+}
 
-        size_t pos = 0;
-        // This helper lambda finds the next line ending (\r\n)
-        auto read_line = [&]() -> std::string_view {
-            size_t start = pos;
-            size_t end = buffer.find("\r\n", pos);
-            if (end == std::string_view::npos) return "";
-            pos = end + 2;
-            return buffer.substr(start, end - start);
-        };
+void submit_accept(struct io_uring *ring, int server_fd) {
+    Connection *conn = new Connection();
+    conn->fd = server_fd;
+    conn->type = OpType::ACCEPT;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_accept(sqe, server_fd, nullptr, nullptr, 0);
+    io_uring_sqe_set_data(sqe, conn);
+}
 
-        std::string_view header = read_line(); // This is the "*3" line
-        int num_args = 0;
-        // Extracting the number after the '*'
-        std::from_chars(header.data() + 1, header.data() + header.size(), num_args);
-
-        Command cmd;
-        for (int i = 0; i < num_args; ++i) {
-            read_line(); // Skip the "$3" (length) lines, we don't strictly need them for this simple version
-            std::string_view arg = read_line(); // This is the actual word (SET, key, or value)
-            if (i == 0) cmd.type = arg;
-            else cmd.args.push_back(arg);
-        }
-        return cmd;
-    }
-};
-
-
+void submit_write(struct io_uring *ring, Connection *conn, std::string resp) {
+    conn->type = OpType::WRITE;
+    conn->response_data = std::move(resp); // move string into the struct to keep memory alive
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_send(sqe, conn->fd, conn->response_data.c_str(), conn->response_data.size(), 0);
+    io_uring_sqe_set_data(sqe, conn);
+}
 
 class ThreadPool {
 private:
@@ -135,7 +91,7 @@ public:
             std::unique_lock<std::mutex> lock(queue_mtx);
             tasks.push(std::move(task));
         }
-        cv.notify_one(); // wake up one idle worker
+        cv.notify_one(); // wake up one idle worker 
     }
     ~ThreadPool() {
         { std::unique_lock<std::mutex> lock(queue_mtx); stop = true; }
@@ -152,7 +108,7 @@ void handle_client(int client_fd, DbSyncEngine &engine) {
         ssize_t bytes_read = read(client_fd, buffer, 1024);
         if(bytes_read <= 0) {
             close(client_fd);
-            break;;
+            break;
         }
         std::string_view raw_request(buffer, bytes_read);
         Command cmd = RespParser::parse(raw_request);
@@ -180,51 +136,103 @@ void handle_client(int client_fd, DbSyncEngine &engine) {
     }
     close(client_fd);
 }
-    
-
-
-int main (){
-    DbSyncEngine engine(16); // create an engine with 16 
-    ThreadPool pool(std::thread::hardware_concurrency());
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("socket");   
+int main() {
+    DbSyncEngine engine(32); // 32 shards to avoid any thread bottlenecks
+    struct io_uring ring;
+    if (io_uring_queue_init(QUEUE_DEPTH, &ring, 0) < 0) {
+        std::cerr << "Failed to init io_uring" << std::endl;
         return 1;
     }
 
+    // Standard Socket Setup
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("socket");
+        return 1;
+    }
     int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
+    sockaddr_in addr{AF_INET, htons(PORT), INADDR_ANY};
     if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind");
         return 1;
     }
+    listen(server_fd, 1024);
 
-    if (listen(server_fd, 128) < 0) {
-        perror("listen");
-        return 1;
-    }
+    // Bootstrap the loop by asking for the first connection
+    submit_accept(&ring, server_fd);
 
-    std::cout << "DBSync server is listening on port " << PORT << "..." << std::endl;
+    std::cout << "🚀 DbSync Phase 3 (io_uring) live on port " << PORT << "..." << std::endl;
 
-    while(true) {
-        int client_fd = accept(server_fd, nullptr, nullptr);
-        std::cout << "Accepted connection on socket: " << client_fd << std::endl;
-        if(client_fd < 0) {
-            std::cerr << "Accept failed" << std::endl;
-            continue;
+    while (true) {
+        struct io_uring_cqe *cqe;
+        io_uring_submit(&ring); // Push all queued requests to the kernel at once
+        
+        // Wait for at least one completion (batching happens here)
+        if (io_uring_wait_cqe(&ring, &cqe) < 0) continue;
+
+        Connection *conn = (Connection *)io_uring_cqe_get_data(cqe);
+        int res = cqe->res; // result of the syscall (bytes read/new fd)
+
+        if (res < 0) {
+            if (conn->type != OpType::ACCEPT) { close(conn->fd); delete conn; }
+        } else if (conn->type == OpType::ACCEPT) {
+            int client_fd = res;
+            Connection *client_conn = new Connection();
+            client_conn->fd = client_fd;
+            submit_read(&ring, client_conn); // Start reading from the new client
+            std::cout << "Reading from client fd: " << client_fd << std::endl;
+            submit_accept(&ring, server_fd); // Listen for the next client
+            delete conn; // Cleanup original accept task
+        } else if (conn->type == OpType::READ) {
+            if (res == 0) { // Client closed connection
+                close(conn->fd);
+                delete conn;
+            } else {
+                TRACE_EVENT("Request_Pipeline_Total");
+                std::string_view raw(conn->buffer, res);
+                Command cmd;
+                {
+                    TRACE_EVENT("Request_Parsing");
+                    cmd = RespParser::parse(raw);
+                }
+
+                std::string response;
+                {
+                    
+
+                    if (cmd.type == "SET" && cmd.args.size() >= 2) {
+                        engine.set(cmd.args[0], cmd.args[1]);
+                        response = "+OK\r\n";
+                    } else if (cmd.type == "GET" && !cmd.args.empty()) {
+                        auto val = engine.get(cmd.args[0]);
+                        if (val) {
+                            std::string_view sv = *val;
+                            response = std::string("$") + std::to_string(sv.size()) + "\r\n";
+                            response.append(sv);
+                            response.append("\r\n");
+                        } else {
+                            response = "$-1\r\n";
+                        }
+                    } else if (cmd.type == "PING") {
+                        response = "+PONG\r\n";
+                    } else {
+                        response = "-ERR unknown command\r\n";
+                    }
+                    
+                }
+                // Simple Command Dispatcher
+                submit_write(&ring, conn, std::move(response));
+            }
+        } else if (conn->type == OpType::WRITE) {
+            // Write finished, immediately wait for the next command on this socket
+            submit_read(&ring, conn);
         }
-        pool.enqueue([client_fd, &engine] {
-            handle_client(client_fd, engine);
-        });
 
+        io_uring_cqe_seen(&ring, cqe); // Tell kernel we processed this completion
     }
-    close(server_fd);
+
+    io_uring_queue_exit(&ring);
     return 0;
-    
 }
