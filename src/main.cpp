@@ -160,7 +160,7 @@ void run_reactor(int reactor_id, int physical_core_id, DbSyncEngine& engine) {
 
 int main() {
     // Increase shards significantly to reduce thread collision
-    DbSyncEngine engine(2048); 
+    DbSyncEngine engine(1024 ); 
     
     int logical_cores = std::thread::hardware_concurrency();
     // We target only physical cores (usually half of logical)

@@ -8,12 +8,15 @@
 #include <optional>
 #include <functional>
 #include <mutex>
+// #include "absl/container/flat_hash_map.h"
 // well this is the class in which is the main Engine of the DBSync server
 
 class DbSyncEngine {
 private:
     struct Shard{
+        // using swiss table to 
         std::unordered_map<std::string,std::string> data;
+        // absl::flat_hash_map<std::string,std::string> data;
         std::shared_mutex mtx; // shared_mutex lets many people read at once, but only one write
     };
     std::vector<Shard> shards; // we split the data into multiple Shards.
