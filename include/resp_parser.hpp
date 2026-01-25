@@ -11,16 +11,17 @@ struct Command{
     std::vector<std::string_view> args; // Ex: SET key value -> args = [key,value]
 };
 
-
+struct ParseResult {
+    Command cmd;
+    size_t consumed;
+};
 
 class RespParser {
 public:
-    static Command parse(std::string_view buffer) {
-        // Redis commands start with '*' if they are an array (which most are)
-        if (buffer.empty() || buffer[0] != '*') return {"UNKNOWN", {}};
+    static ParseResult parse(std::string_view buffer) {
+        if (buffer.empty() || buffer[0] != '*') return {{"UNKNOWN", {}}, 0};
 
         size_t pos = 0;
-        // This helper lambda finds the next line ending (\r\n)
         auto read_line = [&]() -> std::string_view {
             size_t start = pos;
             size_t end = buffer.find("\r\n", pos);
@@ -29,18 +30,24 @@ public:
             return buffer.substr(start, end - start);
         };
 
-        std::string_view header = read_line(); // This is the "*3" line
+        std::string_view header = read_line();
+        if (header.empty()) return {{"INCOMPLETE", {}}, 0};
+        
         int num_args = 0;
-        // Extracting the number after the '*'
         std::from_chars(header.data() + 1, header.data() + header.size(), num_args);
 
         Command cmd;
         for (int i = 0; i < num_args; ++i) {
-            read_line(); // Skip the "$3" (length) lines, we don't strictly need them for this simple version
-            std::string_view arg = read_line(); // This is the actual word (SET, key, or value)
-            if (i == 0) cmd.type = arg;
-            else cmd.args.push_back(arg);
+            read_line(); // Skip length
+            cmd.args.push_back(read_line());
         }
-        return cmd;
+        
+        // The first argument is the command type
+        if (!cmd.args.empty()) {
+            cmd.type = cmd.args[0];
+            cmd.args.erase(cmd.args.begin());
+        }
+
+        return {cmd, pos}; // Return the command AND how many bytes we ate
     }
 };
