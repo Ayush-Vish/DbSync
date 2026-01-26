@@ -165,10 +165,37 @@ void run_reactor(int reactor_id, int physical_core_id, DbSyncEngine &engine)
                     if (consumed == 0)
                         break; // Buffer incomplete or corrupted
 
-                    // --- Execution Logic ---
                     if (cmd.type == "SET" && cmd.args.size() >= 2)
                     {
-                        engine.set(cmd.args[0], cmd.args[1]);
+                        uint64_t ttl_ms = 0;
+                        if (cmd.args.size() >= 4)
+                        {
+                            std::string_view flag = cmd.args[2];
+                            std::string_view timeout = cmd.args[3];
+                            uint64_t val = 0;
+
+                            // Fast numeric parsing (No exceptions)
+                            auto [ptr, ec] = std::from_chars(timeout.data(), timeout.data() + timeout.size(), val);
+
+                            if (ec == std::errc())
+                            {
+                                if (flag == "EX" || flag == "ex")
+                                {
+                                    ttl_ms = val * 1000; // Convert seconds to ms
+                                }
+                                else if (flag == "PX" || flag == "px")
+                                {
+                                    ttl_ms = val;
+                                }
+                            }
+                        }
+                        // Case: SET key value 2000 (3 args - custom non-standard behavior)
+                        else if (cmd.args.size() == 3)
+                        {
+                            std::from_chars(cmd.args[2].data(), cmd.args[2].data() + cmd.args[2].size(), ttl_ms);
+                        }
+
+                        engine.set(cmd.args[0], cmd.args[1], ttl_ms);
                         conn->response_data.append("+OK\r\n");
                     }
                     else if (cmd.type == "GET" && !cmd.args.empty())
@@ -182,6 +209,17 @@ void run_reactor(int reactor_id, int physical_core_id, DbSyncEngine &engine)
                         {
                             conn->response_data.append("$-1\r\n");
                         }
+                    }
+                    else if (cmd.type == "EXPIRE" && cmd.args.size() >= 2)
+                    {
+                        uint64_t ttl_ms = 0;
+                        auto arg = cmd.args[1];
+                        std::from_chars(arg.data(), arg.data() + arg.size(), ttl_ms);
+
+                        // TODO: Implement EXPIRE logic in DbSyncEngine
+                        //  For now, just respond with 1 (success)
+
+                        conn->response_data.append(":1\r\n");
                     }
                     else if (cmd.type == "PING")
                     {
@@ -225,11 +263,57 @@ void run_reactor(int reactor_id, int physical_core_id, DbSyncEngine &engine)
     }
 }
 
+void run_janitor(DbSyncEngine &engine)
+{
+    while (true)
+    {
+        for (int i = 0; i < engine.get_shard_count(); ++i)
+        {
+            auto &s = engine.get_shard(i);
+
+            // Try to lock without blocking the 4M RPS reactors
+            std::unique_lock lock(s.mtx, std::try_to_lock);
+            if (!lock.owns_lock() || s.data.empty())
+                continue;
+
+            int expired_found = 0;
+            int sampled = 0;
+            auto it = s.data.begin();
+
+            // Random sampling: check up to 20 keys
+            while (sampled < 20 && it != s.data.end())
+            {
+                if (it->second.expires_at > 0 && it->second.expires_at < engine.get_now())
+                {
+                    // Capture current, then increment it BEFORE erasing
+                    auto current = it++;
+                    s.data.erase(current);
+                    expired_found++;
+                }
+                else
+                {
+                    ++it;
+                }
+                sampled++;
+            }
+
+            // If the shard is "dirty" (>25% expired), we don't sleep
+            if (expired_found > 1)
+                continue;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
 int main()
 {
     // Increase shards significantly to reduce thread collision
     DbSyncEngine engine(4096); // 4096 shards
+    // BG thread for expired key cleanup
+    std::thread janitor_thread(run_janitor, std::ref(engine));
+    janitor_thread.detach();
 
+    std::cout << "🧹 Janitor active: Sampling shards for expired keys..." << std::endl;
     int logical_cores = std::thread::hardware_concurrency();
     // We target only physical cores (usually half of logical)
     int num_reactors = logical_cores / 2;
