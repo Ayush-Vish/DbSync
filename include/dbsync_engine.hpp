@@ -9,6 +9,7 @@
 #include <functional>
 #include <chrono>
 #include <mutex>
+#include <fcntl.h>
 #include "absl/container/flat_hash_map.h"
 // well this is the class in which is the main Engine of the DBSync server
 
@@ -24,7 +25,6 @@ private:
         // using swiss table to 
         // std::unordered_map<std::string,std::string> data;
         absl::flat_hash_map<std::string, ValueEntry> data;
-        std::shared_mutex mtx; // shared_mutex lets many people read at once, but only one write
     };
     std::vector<Shard> shards; // we split the data into multiple Shards.
     int shard_count;
@@ -35,7 +35,11 @@ private:
     }
 
     public:
-    DbSyncEngine(int num_shards) : shard_count(num_shards), shards(num_shards) {}
+    int aof_fd;
+    DbSyncEngine(int num_shards) : shard_count(num_shards), shards(num_shards) {
+        aof_fd = open("appendonly.aof", O_WRONLY | O_CREAT | O_APPEND, 0644); // open the aof file in append mode , create if not exists,
+        if (aof_fd < 0) perror("Failed to open AOF");
+    }
     
     uint64_t get_now(){
         return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -53,18 +57,14 @@ private:
         auto &s = shards[get_shard_index(key)];
         uint64_t expiry = ttl_ms > 0 ? get_now() + ttl_ms : 0;
 
-        std::unique_lock lock(s.mtx);
         s.data[std::string(key)] = {std::string(value),expiry};
     }
     // The Get Operation
     std::optional<std::string> get (const std::string_view key   ) {
         auto &s = shards[get_shard_index(key)];
-        std::shared_lock lock(s.mtx);
         auto it = s.data.find(std::string(key));
         if(it == s.data.end()) return std::nullopt;
         if(it->second.expires_at != 0&&it->second.expires_at <get_now()){
-            lock.unlock(); 
-            std::unique_lock write_lock(s.mtx);
             s.data.erase(std::string(key));
             return std::nullopt;
         }
@@ -73,7 +73,6 @@ private:
 
     bool del(std::string_view key) {
         auto& s = shards[get_shard_index(key)];
-        std::unique_lock lock(s.mtx); // we need to lock the shard to delete safely
         return s.data.erase(std::string(key)) > 0;
     }
 };

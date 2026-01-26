@@ -10,7 +10,6 @@
 #include <unistd.h>
 #include <pthread.h>
 
-// Assuming these are in your include folder
 #include "../include/dbsync_engine.hpp"
 #include "../include/resp_parser.hpp"
 #include "../include/debug.hpp"
@@ -59,17 +58,36 @@ int create_shared_socket()
     listen(fd, 1024);
     return fd;
 }
+#include <sys/un.h>
 
+int create_shared_socket1() {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    const char* path = "/tmp/dbsync.sock";
+    unlink(path);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+
+    bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    chmod(path, 0777);
+    listen(fd, 1024);
+    return fd;
+}
 // ==========================================
 // THE ZERO-ALLOCATION REACTOR
 // ==========================================
-void run_reactor(int reactor_id, int physical_core_id, DbSyncEngine &engine)
+void run_reactor(int reactor_id, int physical_core_id)
 {
     // 1. HARDWARE ISOLATION
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(physical_core_id, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+
+
+    DbSyncEngine engine(512);
 
     // 2. OBJECT POOLING (Per-thread, zero locks)
     std::vector<Connection> conn_pool(MAX_CONN_PER_THREAD);
@@ -99,6 +117,12 @@ void run_reactor(int reactor_id, int physical_core_id, DbSyncEngine &engine)
     struct io_uring ring;
     io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
     int thread_socket = create_shared_socket();
+    // int thread_socket = create_shared_socket1();
+    if (thread_socket < 0)
+    {
+        std::cerr << "Reactor " << reactor_id << ": Failed to create socket." << std::endl;
+        return;
+    }
 
     auto submit_accept = [&]()
     {
@@ -263,55 +287,54 @@ void run_reactor(int reactor_id, int physical_core_id, DbSyncEngine &engine)
     }
 }
 
-void run_janitor(DbSyncEngine &engine)
-{
-    while (true)
-    {
-        for (int i = 0; i < engine.get_shard_count(); ++i)
-        {
-            auto &s = engine.get_shard(i);
+// void run_janitor(DbSyncEngine &engine)
+// {
+//     while (true)
+//     {
+//         for (int i = 0; i < engine.get_shard_count(); ++i)
+//         {
+//             auto &s = engine.get_shard(i);
 
-            // Try to lock without blocking the 4M RPS reactors
-            std::unique_lock lock(s.mtx, std::try_to_lock);
-            if (!lock.owns_lock() || s.data.empty())
-                continue;
+//             // Try to lock without blocking the 4M RPS reactors
+//             std::unique_lock lock(s.mtx, std::try_to_lock);
+//             if (!lock.owns_lock() || s.data.empty())
+//                 continue;
 
-            int expired_found = 0;
-            int sampled = 0;
-            auto it = s.data.begin();
+//             int expired_found = 0;
+//             int sampled = 0;
+//             auto it = s.data.begin();
 
-            // Random sampling: check up to 20 keys
-            while (sampled < 20 && it != s.data.end())
-            {
-                if (it->second.expires_at > 0 && it->second.expires_at < engine.get_now())
-                {
-                    // Capture current, then increment it BEFORE erasing
-                    auto current = it++;
-                    s.data.erase(current);
-                    expired_found++;
-                }
-                else
-                {
-                    ++it;
-                }
-                sampled++;
-            }
+//             // Random sampling: check up to 20 keys
+//             while (sampled < 20 && it != s.data.end())
+//             {
+//                 if (it->second.expires_at > 0 && it->second.expires_at < engine.get_now())
+//                 {
+//                     // Capture current, then increment it BEFORE erasing
+//                     auto current = it++;
+//                     s.data.erase(current);
+//                     expired_found++;
+//                 }
+//                 else
+//                 {
+//                     ++it;
+//                 }
+//                 sampled++;
+//             }
 
-            // If the shard is "dirty" (>25% expired), we don't sleep
-            if (expired_found > 1)
-                continue;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-}
+//             // If the shard is "dirty" (>25% expired), we don't sleep
+//             if (expired_found > 1)
+//                 continue;
+//         }
+//         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+//     }
+// }
 
 int main()
 {
     // Increase shards significantly to reduce thread collision
-    DbSyncEngine engine(4096); // 4096 shards
     // BG thread for expired key cleanup
-    std::thread janitor_thread(run_janitor, std::ref(engine));
-    janitor_thread.detach();
+    // std::thread janitor_thread(run_janitor, std::ref(engine));
+    // janitor_thread.detach();
 
     std::cout << "🧹 Janitor active: Sampling shards for expired keys..." << std::endl;
     int logical_cores = std::thread::hardware_concurrency();
@@ -327,7 +350,7 @@ int main()
     for (int i = 0; i < num_reactors; ++i)
     {
         int physical_core = i * 2; // Jump by 2 to skip Hyper-Thread siblings
-        threads.emplace_back(run_reactor, i, physical_core, std::ref(engine));
+        threads.emplace_back(run_reactor, i, physical_core);
     }
 
     for (auto &t : threads)

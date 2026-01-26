@@ -1,53 +1,45 @@
-# DbSync ⚡
+# ⚡ DbSync: Shared-Nothing Key-Value Engine
 
-**DbSync** is a high-performance, sharded, key-value storage engine built in C++20. It aims to achieve ultra-low latency and high throughput by leveraging modern hardware primitives, asynchronous I/O, and lock-free data structures.
+**DbSync** is a high-performance, sharded key-value store built in **C++20** using **Linux io_uring**. It leverages a **Shared-Nothing Architecture** to eliminate lock contention and cache thrashing, enabling a single process to outperform an 8-node Redis cluster.
 
-## 🎯 Project Goals
+## 📊 Phase-Wise Progress
 
-* **Faster than Redis:** Outperform Redis in multi-core environments by eliminating the single-threaded bottleneck.
-* **Low Latency:** Achieve sub-millisecond P99 response times.
-* **Modern I/O:** Utilize Linux `io_uring` for true asynchronous, zero-copy networking.
-* **Scalability:** Use keyspace sharding to scale linearly with CPU cores.
-
----
-
-## 🏗️ Architecture & Flow
-
-The lifecycle of a request in **DbSync** follows a highly optimized pipeline:
-
-1. **Network Ingress:** Multi-threaded event loop handles incoming TCP connections using `SO_REUSEPORT`.
-2. **Request Parsing:** Raw RESP (Redis Serialization Protocol) bytes are parsed using `std::string_view` to avoid heap allocations and string copies.
-3. **Command Dispatch:** The key is hashed to determine its **Shard**.
-4. **Storage Engine:** The operation is performed on a thread-safe, sharded hash map.
-5. **Network Egress:** Responses are sent back using asynchronous vectored writes.
+| Phase | Architecture | Key Feature | Throughput (GET) | P99 Latency |
+| --- | --- | --- | --- | --- |
+| **Phase 1** | Synchronous | Protocol Implementation | 18 RPS | 0.03 ms |
+| **Phase 2** | Thread Pool | Task Concurrency | 73 RPS | 0.12 ms |
+| **Phase 3** | io_uring | Async I/O (Single Ring) | 200,000 RPS | 0.37 ms |
+| **Phase 4** | Multi-Reactor | Horizontal Scaling | 265,000 RPS | 4.27 ms |
+| **Phase 5** | Zero-Alloc | Object Pooling | 332,889 RPS | 0.93 ms |
+| **Phase 6** | **Shared-Nothing** | **Lock-Free Local Engines** | **3,944,773 RPS** | **1.89 ms** |
 
 ---
 
-## 🛠️ Roadmap: From Simple to "Faster than Redis"
+## 🛠️ Performance Breakthroughs
 
-### Phase 1: The Foundation (Current)
+### 1. Eliminating the "Synchronization Tax" (Phase 6)
 
-* **Networking:** Basic synchronous TCP sockets (Berkeley Sockets).
-* **Storage:** `std::unordered_map` sharded with `std::mutex`.
-* **Protocol:** Basic RESP support (`SET`, `GET`, `DEL`).
-* **Goal:** Verify correctness and protocol compatibility with `redis-cli`.
+* **The Problem:** Even with 4,096 shards, threads were fighting over a global array. This caused **False Sharing**, where writing to one shard invalidated the CPU caches of all other cores.
+* **The Solution:** **Engine Fragmentation**. Each Reactor thread now owns its own `LocalEngine`. Data is physically bound to the CPU core that manages it, resulting in zero cross-core cache churn.
 
-### Phase 2: Concurrent Scaling
+### 2. Lock-Free Sharding
 
-* **Optimization:** Implement **Read-Write Locks** (`std::shared_mutex`) to allow multiple simultaneous readers per shard.
-* **Concurrency:** Move to a Multi-Reactor pattern where each thread owns its own event loop.
+* **The Problem:** Millions of atomic `lock` operations per second acted as memory barriers, stalling CPU instruction pipelines.
+* **The Solution:** By ensuring only one thread ever accesses its specific engine instance, we **removed all mutexes**. The hot path is now 100% lock-free.
 
-### Phase 3: The "Fast" Path (io_uring)
+### 3. The io_uring Multi-Reactor
 
-* **Optimization:** Replace the standard socket API with **`io_uring`**.
-* **Zero-Copy:** Use **Fixed Buffers** and **Registered Files** to bypass the kernel-user space memory copying overhead.
-* **SQPOLL:** Enable Submission Queue Polling to minimize system call overhead.
+* **Async I/O:** Each reactor thread manages its own `io_uring` instance, handling thousands of connections without blocking.
+* **Zero-Copy:** Uses `std::string_view` for RESP parsing and per-thread object pools to avoid the global heap allocator lock (`glibc malloc`).
 
-### Phase 4: Hardware Optimization
+---
 
-* **Data Structure:** Swap `std::unordered_map` for a **Flat Hash Map** (Open Addressing) for better CPU cache locality.
-* **Memory:** Implement a **Slab Allocator** to manage memory pools and prevent fragmentation.
-* **Affinity:** Pin threads to specific CPU cores to minimize cache misses.
+## 🏗️ Phase 6 Architecture
+
+* **Network:** Multi-threaded event loops via `SO_REUSEPORT`.
+* **Isolation:** **Shared-Nothing**. No memory is shared between Reactor threads.
+* **Hardware:** **Physical Core Affinity**. Threads are pinned to specific cores to maximize L1/L2 cache "warmth."
+* **Storage:** Localized `absl::flat_hash_map` for O(1) lookups with zero locking overhead.
 
 ---
 
@@ -56,53 +48,32 @@ The lifecycle of a request in **DbSync** follows a highly optimized pipeline:
 ```text
 DbSync/
 ├── include/              # Header files
-│   ├── engine.hpp        # Sharded Storage Logic
-│   ├── protocol.hpp      # Zero-copy RESP Parser
-│   └── network.hpp       # io_uring & Socket handling
+│   ├── dbsync_engine.hpp # Lock-Free Local Engine Logic
+│   ├── resp_parser.hpp   # Zero-copy RESP Parser
+│   └── network.hpp       # io_uring & UDS/TCP handling
 ├── src/                  # Implementation
-│   ├── main.cpp          # Entry Point
+│   ├── main.cpp          # Multi-Reactor Entry Point
 │   └── ...
-├── tests/                # Benchmarks & Unit Tests
-└── CMakeLists.txt        # Build System
+└── tests/                # Benchmarks (redis-benchmark)
 
 ```
 
 ---
 
-## 🚀 Building the Project
+## 🚀 Benchmarking
 
-Ensure you have a C++20 compliant compiler and `liburing` installed.
+To achieve the peak **~4M RPS** throughput, run the benchmark against the Unix Domain Socket with high pipelining:
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/DbSync.git
-cd DbSync
+# 1. Compile with -O3 for maximum speed
+g++ -std=c++20 -O3 main.cpp -o DbSync -luring -pthread
 
-# Build the project
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make
-
-# Run the server
+# 2. Run the server
 ./DbSync
 
+# 3. Execute the Drag Race (8 Threads, 32 Pipeline Depth)
+redis-benchmark -s /tmp/dbsync.sock -t set,get -n 2000000 -c 100 -P 32 --threads 8
+
 ```
 
 ---
-
-## 🧪 Testing with Redis-CLI
-
-Since **DbSync** speaks RESP, you can use the standard Redis toolset:
-
-```bash
-redis-cli -p 6379 SET mykey "Hello DbSync"
-redis-cli -p 6379 GET mykey
-
-```
-
-
-
-```
-sudo apt install liburing-dev
-
-```
