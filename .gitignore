@@ -1,1 +1,12 @@
 .rdb
+*.aof
+*.log
+*.pid
+*.swp
+.DS_Store
+build/
+.vscode/
+
+# Ignore database files
+data/
+logs/
