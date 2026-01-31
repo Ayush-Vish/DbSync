@@ -10,35 +10,168 @@
 #include <chrono>
 #include <mutex>
 #include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <iostream>
+#include <charconv>
 #include "absl/container/flat_hash_map.h"
-// well this is the class in which is the main Engine of the DBSync server
 
-struct ValueEntry{
+struct ValueEntry {
     std::string data;
     uint64_t expires_at; // timestamp in milliseconds
 };
 
-
 class DbSyncEngine {
 private:
-    struct Shard{
-        // using swiss table to 
-        // std::unordered_map<std::string,std::string> data;
+    struct Shard {
         absl::flat_hash_map<std::string, ValueEntry> data;
     };
-    std::vector<Shard> shards; // we split the data into multiple Shards.
+    std::vector<Shard> shards;
     int shard_count;
+    int reactor_id;
+    std::string file_name;
 
-    int get_shard_index (const  std::string_view&key) {
-        return std::hash<std::string_view>{}(key) % shard_count; // -> returns the index of the shard for a given key
-        // What if it gives the same index for every key? -> then all keys go to the same shard
+    int get_shard_index(const std::string_view& key) {
+        return std::hash<std::string_view>{}(key) % shard_count;
     }
 
-    public:
-    int aof_fd;
-    DbSyncEngine(int num_shards) : shard_count(num_shards), shards(num_shards) {
-        aof_fd = open("appendonly.aof", O_WRONLY | O_CREAT | O_APPEND, 0644); // open the aof file in append mode , create if not exists,
-        if (aof_fd < 0) perror("Failed to open AOF");
+    // Parse a single RESP bulk string, returns the string and advances pos
+    std::string_view parse_bulk_string(const char* data, size_t len, size_t& pos) {
+        if (pos >= len || data[pos] != '$') return {};
+        
+        size_t line_end = pos;
+        while (line_end < len && data[line_end] != '\r') line_end++;
+        if (line_end + 1 >= len) return {};
+        
+        int str_len = 0;
+        std::from_chars(data + pos + 1, data + line_end, str_len);
+        pos = line_end + 2; // skip \r\n
+        
+        if (pos + str_len > len) return {};
+        std::string_view result(data + pos, str_len);
+        pos += str_len + 2; // skip string + \r\n
+        return result;
+    }
+
+public:
+    int aof_fd = -1;
+
+    DbSyncEngine(int num_shards, int reactor_id = -1) 
+        : shard_count(num_shards), shards(num_shards), reactor_id(reactor_id) {
+        
+        if (reactor_id != -1) {
+            file_name = "appendonly_" + std::to_string(reactor_id) + ".aof";
+            
+            // First recover existing data
+            recover_from_aof();
+            
+            // Then open for append
+            aof_fd = open(file_name.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_NOATIME, 0644);
+            if (aof_fd < 0) {
+                perror("Failed to open AOF for writing");
+            }
+        }
+    }
+
+    ~DbSyncEngine() {
+        if (aof_fd >= 0) {
+            fsync(aof_fd);
+            close(aof_fd);
+        }
+    }
+
+    void recover_from_aof() {
+        int fd = open(file_name.c_str(), O_RDONLY);
+        if (fd < 0) {
+            std::cout << "[Reactor " << reactor_id << "] No AOF file found, starting fresh." << std::endl;
+            return;
+        }
+
+        // Get file size
+        struct stat st;
+        fstat(fd, &st);
+        size_t file_size = st.st_size;
+        
+        if (file_size == 0) {
+            close(fd);
+            return;
+        }
+
+        // Read entire file
+        std::vector<char> buffer(file_size);
+        ssize_t bytes_read = read(fd, buffer.data(), file_size);
+        close(fd);
+
+        if (bytes_read <= 0) return;
+
+        const char* data = buffer.data();
+        size_t len = bytes_read;
+        size_t pos = 0;
+        size_t commands_recovered = 0;
+
+        while (pos < len) {
+            // Expect *N\r\n (array header)
+            if (data[pos] != '*') break;
+            
+            size_t line_end = pos;
+            while (line_end < len && data[line_end] != '\r') line_end++;
+            if (line_end + 1 >= len) break;
+            
+            int num_args = 0;
+            std::from_chars(data + pos + 1, data + line_end, num_args);
+            pos = line_end + 2; // skip \r\n
+            
+            if (num_args < 1) break;
+
+            // Parse command name
+            std::string_view cmd_name = parse_bulk_string(data, len, pos);
+            if (cmd_name.empty()) break;
+
+            // Handle SET command: *3\r\n$3\r\nSET\r\n$keylen\r\nkey\r\n$vallen\r\nval\r\n
+            if ((cmd_name == "SET" || cmd_name == "set") && num_args >= 3) {
+                std::string_view key = parse_bulk_string(data, len, pos);
+                std::string_view value = parse_bulk_string(data, len, pos);
+                
+                if (!key.empty() && !value.empty()) {
+                    // Check for optional TTL args (PXAT, PX, EX)
+                    uint64_t ttl_ms = 0;
+                    if (num_args >= 5) {
+                        std::string_view flag = parse_bulk_string(data, len, pos);
+                        std::string_view timeout = parse_bulk_string(data, len, pos);
+                        
+                        uint64_t val = 0;
+                        std::from_chars(timeout.data(), timeout.data() + timeout.size(), val);
+                        
+                        if (flag == "PXAT" || flag == "pxat") {
+                            // Absolute timestamp - check if already expired
+                            if (val > get_now()) {
+                                ttl_ms = val - get_now();
+                            } else {
+                                // Already expired, skip this key
+                                commands_recovered++;
+                                continue;
+                            }
+                        } else if (flag == "PX" || flag == "px") {
+                            ttl_ms = val;
+                        } else if (flag == "EX" || flag == "ex") {
+                            ttl_ms = val * 1000;
+                        }
+                    }
+                    
+                    set(key, value, ttl_ms);
+                    commands_recovered++;
+                }
+            }
+            // Skip other commands for now (just consume their args)
+            else {
+                for (int i = 1; i < num_args; i++) {
+                    parse_bulk_string(data, len, pos);
+                }
+            }
+        }
+
+        std::cout << "[Reactor " << reactor_id << "] Recovered " << commands_recovered 
+                  << " commands from " << file_name << std::endl;
     }
     
     uint64_t get_now(){
