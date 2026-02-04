@@ -38,6 +38,12 @@ struct Connection
     char aof_buf[1024];
     uint32_t aof_len = 0;
 
+    /**
+     * @brief Reset connection runtime state to its initial (unused) values.
+     *
+     * Clears outgoing response data, marks the file descriptor as invalid, and
+     * resets the staged AOF buffer length to zero.
+     */
     void reset()
     {
         fd = -1;
@@ -46,6 +52,13 @@ struct Connection
     }
 };
 
+/**
+ * @brief Create and return a TCP listening socket bound to the configured PORT on all interfaces.
+ *
+ * The socket is configured for address and port reuse and is placed into listening state.
+ *
+ * @return int File descriptor of the listening socket on success, `-1` on failure.
+ */
 int create_shared_socket()
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -67,6 +80,16 @@ int create_shared_socket()
     return fd;
 }
 
+/**
+ * @brief Starts and runs a per-reactor event loop pinned to a physical core.
+ *
+ * Initializes a per-reactor DbSyncEngine and an io_uring-based reactor that accepts connections,
+ * performs asynchronous reads/writes, parses RESP commands (GET/SET/EXPIRE/PING/CONFIG), persists
+ * SET operations to the reactor's AOF before replying, and manages a fixed-size connection pool.
+ *
+ * @param reactor_id Logical reactor identifier used to scope the per-reactor AOF and engine.
+ * @param physical_core_id Physical CPU core index to which this reactor thread will be pinned.
+ */
 void run_reactor(int reactor_id, int physical_core_id)
 {
     cpu_set_t cpuset;
@@ -307,6 +330,15 @@ void run_reactor(int reactor_id, int physical_core_id)
     }
 }
 
+/**
+ * @brief Program entry that starts per-reactor event loops and pins each reactor thread to a physical core.
+ *
+ * The function determines the number of reactor threads as half the available logical cores (minimum 1),
+ * launches each reactor via run_reactor(reacator_id, physical_core_id) with a physical core stride of 2,
+ * and joins all reactor threads before exiting.
+ *
+ * @return int 0 on successful termination.
+ */
 int main()
 {
     std::cout << "🧹 Janitor active: Sampling shards for expired keys..." << std::endl;

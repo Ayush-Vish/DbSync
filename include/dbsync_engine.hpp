@@ -1,4 +1,3 @@
-
 #pragma once
 #include <string>
 #include <string_view>
@@ -31,11 +30,27 @@ private:
     int reactor_id;
     std::string file_name;
 
+    /**
+     * @brief Computes the target shard index for a given key.
+     *
+     * @param key Key to map to a shard.
+     * @return int Shard index in the range [0, shard_count).
+     */
     int get_shard_index(const std::string_view& key) {
         return std::hash<std::string_view>{}(key) % shard_count;
     }
 
-    // Parse a single RESP bulk string, returns the string and advances pos
+    /**
+     * @brief Parses a RESP bulk string at the current cursor and returns its contents.
+     *
+     * Parses a RESP bulk string that begins at data[pos], advances pos past the parsed bulk string
+     * (including trailing CRLF), and returns a std::string_view referencing the string payload.
+     *
+     * @param data Pointer to the buffer containing RESP data.
+     * @param len Length of the buffer in bytes.
+     * @param pos Reference to the current read position; updated to the byte immediately after the bulk string's trailing CRLF on success.
+     * @return std::string_view The bulk string payload if parsing succeeds, or an empty string_view on failure.
+     */
     std::string_view parse_bulk_string(const char* data, size_t len, size_t& pos) {
         if (pos >= len || data[pos] != '$') return {};
         
@@ -56,6 +71,17 @@ private:
 public:
     int aof_fd = -1;
 
+    /**
+     * @brief Initializes the in-memory key-value engine with sharding and optional per-reactor AOF support.
+     *
+     * Constructs the engine with the specified number of shards. If `reactor_id` is greater than or equal to 0,
+     * the engine sets a reactor-specific AOF file name, attempts to recover state from that AOF, and opens the AOF
+     * for append-based persistence.
+     *
+     * @param num_shards Number of shards to create for partitioning the keyspace.
+     * @param reactor_id Reactor identifier; if >= 0, enable per-reactor AOF recovery and persistence using
+     *                   the file named "appendonly_<reactor_id>.aof". If < 0, AOF is disabled.
+     */
     DbSyncEngine(int num_shards, int reactor_id = -1) 
         : shard_count(num_shards), shards(num_shards), reactor_id(reactor_id) {
         
@@ -73,6 +99,12 @@ public:
         }
     }
 
+    /**
+     * @brief Flushes and closes the append-only file when the engine is destroyed.
+     *
+     * Ensures any pending AOF data is persisted with `fsync` and the file descriptor
+     * is closed if the engine opened an append-only file.
+     */
     ~DbSyncEngine() {
         if (aof_fd >= 0) {
             fsync(aof_fd);
@@ -80,6 +112,18 @@ public:
         }
     }
 
+    /**
+     * @brief Rebuilds in-memory key-value state by replaying SET commands from the engine's AOF file.
+     *
+     * Reads the reactor-specific append-only file, parses stored RESP commands, and applies recovered
+     * SET entries (including optional PXAT/PX/EX TTLs) into the in-memory shards. Expired entries
+     * encountered during recovery are skipped. If no AOF file is present or it is empty, the method
+     * leaves the database empty.
+     *
+     * Side effects:
+     * - Populates the engine's shards via calls to set().
+     * - Logs recovery progress and missing-file conditions to stdout.
+     */
     void recover_from_aof() {
         int fd = open(file_name.c_str(), O_RDONLY);
         if (fd < 0) {
@@ -174,6 +218,11 @@ public:
                   << " commands from " << file_name << std::endl;
     }
     
+    /**
+     * @brief Gets the current time as milliseconds since the Unix epoch.
+     *
+     * @return uint64_t Current time in milliseconds since 1970-01-01T00:00:00 UTC as reported by std::chrono::system_clock.
+     */
     uint64_t get_now(){
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
