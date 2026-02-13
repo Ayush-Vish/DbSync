@@ -2,7 +2,7 @@
 #include <iostream>
 using namespace std;
 
-void print_cli(){
+inline void print_cli(){
     cout << R"(
     ██████╗ ██████╗ ███████╗██╗   ██╗███╗   ██╗ ██████╗
     ██╔══██╗██╔══██╗██╔════╝╚██╗ ██╔╝████╗  ██║██╔════╝
