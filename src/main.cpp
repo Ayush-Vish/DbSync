@@ -68,9 +68,25 @@ struct Connection
 int create_shared_socket()
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == -1)
+    {
+        perror("socket failed");
+        return -1;
+    }
+    
     int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
+    {
+        perror("setsockopt SO_REUSEADDR failed");
+        close(fd);
+        return -1;
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0)
+    {
+        perror("setsockopt SO_REUSEPORT failed");
+        close(fd);
+        return -1;
+    }
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -80,9 +96,15 @@ int create_shared_socket()
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
         perror("Bind failed");
+        close(fd);
         return -1;
     }
-    listen(fd, 1024);
+    if (listen(fd, 1024) < 0)
+    {
+        perror("listen failed");
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
