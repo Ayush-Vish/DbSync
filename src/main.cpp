@@ -534,7 +534,7 @@ int main()
     std::cout << "🔥 DbSync Phase 6: Shared-Nothing Dragonfly Architecture" << std::endl;
     std::cout << "🚀 Core Pinning: Using " << num_reactors << " Physical Cores" << std::endl;
     std::cout << "📡 ITC: moodycamel ConcurrentQueue (" << num_reactors << " inboxes)" << std::endl;
-
+    
     for (int i = 0; i < num_reactors; ++i)
     {
         int physical_core = i * 2;
