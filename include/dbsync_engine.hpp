@@ -27,13 +27,50 @@ private:
         absl::flat_hash_map<std::string, ValueEntry> data;
     };
     std::vector<Shard> shards;
-    int shard_count;
+    int shard_count;        // Local shards per reactor
+    int num_reactors;       // MUST be before total_shards!
+    int total_shards;       // Global total shards across all reactors
     int reactor_id;
+    int shard_start;        // First global shard this reactor owns
+    int shard_end;          // Last global shard (exclusive) this reactor owns
     std::string file_name;
 
-    int get_shard_index(const std::string_view& key) {
-        return std::hash<std::string_view>{}(key) % shard_count;
+    // FNV-1a hash for fast key ownership determination
+    static constexpr uint64_t fnv1a_hash(std::string_view key) {
+        uint64_t hash = 14695981039346656037ULL;
+        for (char c : key) {
+            hash ^= static_cast<uint64_t>(c);
+            hash *= 1099511628211ULL;
+        }
+        return hash;
     }
+
+    // Get global shard index for a key
+    int get_global_shard_index(std::string_view key) const {
+        return fnv1a_hash(key) % total_shards;
+    }
+
+    // Get local shard index (within this reactor's shards)
+    int get_local_shard_index(std::string_view key) const {
+        int global_idx = get_global_shard_index(key);
+        return global_idx - shard_start;
+    }
+
+public:
+    // Determine which reactor owns a key
+    int fast_owner(std::string_view key) const {
+        int global_shard = get_global_shard_index(key);
+        return global_shard / shard_count;  // shard_count = shards per reactor
+    }
+
+    // Check if this reactor owns a key
+    bool owns_key(std::string_view key) const {
+        int global_shard = get_global_shard_index(key);
+        return global_shard >= shard_start && global_shard < shard_end;
+    }
+
+    int get_reactor_id() const { return reactor_id; }
+    int get_num_reactors() const { return num_reactors; }
 
     // Parse a single RESP bulk string, returns the string and advances pos
     std::string_view parse_bulk_string(const char* data, size_t len, size_t& pos) {
@@ -56,8 +93,20 @@ private:
 public:
     int aof_fd = -1;
 
-    DbSyncEngine(int num_shards, int reactor_id = -1) 
-        : shard_count(num_shards), shards(num_shards), reactor_id(reactor_id) {
+    // Constructor with global shard partitioning
+    // shards_per_reactor: number of shards this reactor manages locally
+    // reactor_id: this reactor's ID (0 to num_reactors-1)
+    // num_reactors: total number of reactors
+    DbSyncEngine(int shards_per_reactor, int reactor_id = -1, int num_reactors = 1) 
+        : shards(shards_per_reactor),
+          shard_count(shards_per_reactor), 
+          num_reactors(num_reactors),
+          total_shards(shards_per_reactor * num_reactors),
+          reactor_id(reactor_id) {
+        
+        // Calculate which global shards this reactor owns
+        shard_start = reactor_id * shard_count;
+        shard_end = shard_start + shard_count;
         
         if (reactor_id != -1) {
             file_name = "appendonly_" + std::to_string(reactor_id) + ".aof";
@@ -178,6 +227,12 @@ public:
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
     }
+
+    // Get local shard index for set/get operations (must own the key!)
+    int get_shard_index(std::string_view key) const {
+        return get_local_shard_index(key);
+    }
+
     // The Set Operation
     int get_shard_count() const {
         return shard_count;
@@ -186,18 +241,21 @@ public:
     Shard& get_shard(int index) {
         return shards[index];
     }
-    void set(const std::string_view key, const std::string_view value, uint64_t ttl_ms = 0) {
-        auto &s = shards[get_shard_index(key)];
-        uint64_t expiry = ttl_ms > 0 ? get_now() + ttl_ms : 0;
 
-        s.data[std::string(key)] = {std::string(value),expiry};
+    void set(std::string_view key, std::string_view value, uint64_t ttl_ms = 0) {
+        int local_idx = get_local_shard_index(key);
+        auto& s = shards[local_idx];
+        uint64_t expiry = ttl_ms > 0 ? get_now() + ttl_ms : 0;
+        s.data[std::string(key)] = {std::string(value), expiry};
     }
+
     // The Get Operation
-    std::optional<std::string> get (const std::string_view key   ) {
-        auto &s = shards[get_shard_index(key)];
+    std::optional<std::string> get(std::string_view key) {
+        int local_idx = get_local_shard_index(key);
+        auto& s = shards[local_idx];
         auto it = s.data.find(std::string(key));
-        if(it == s.data.end()) return std::nullopt;
-        if(it->second.expires_at != 0&&it->second.expires_at <get_now()){
+        if (it == s.data.end()) return std::nullopt;
+        if (it->second.expires_at != 0 && it->second.expires_at < get_now()) {
             s.data.erase(std::string(key));
             return std::nullopt;
         }
@@ -205,7 +263,8 @@ public:
     }
 
     bool del(std::string_view key) {
-        auto& s = shards[get_shard_index(key)];
+        int local_idx = get_local_shard_index(key);
+        auto& s = shards[local_idx];
         return s.data.erase(std::string(key)) > 0;
     }
 };
