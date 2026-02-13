@@ -41,9 +41,8 @@ struct Connection
     char buffer[4096];
     std::string response_data;
 
-    // AOF buffer
-    char aof_buf[1024];
-    uint32_t aof_len = 0;
+    // AOF buffer - use string to accumulate multiple entries
+    std::string aof_data;
 
     // ITC tracking for shared-nothing architecture
     int pending_itc = 0;                        // Outstanding ITC requests
@@ -56,7 +55,7 @@ struct Connection
     {
         fd = -1;
         response_data.clear();
-        aof_len = 0;
+        aof_data.clear();
         pending_itc = 0;
         pipeline_results.clear();
         expected_results = 0;
@@ -226,13 +225,24 @@ void run_reactor(int reactor_id, int physical_core_id)
                 // Process SET request from another reactor
                 engine.set(msg.get_key(), msg.get_value(), msg.ttl_ms);
                 
-                // Write to AOF for remote SETs
+                // Write to AOF for remote SETs with TTL if present
                 if (engine.aof_fd >= 0) {
                     char aof_buf[1024];
-                    int aof_len = snprintf(aof_buf, sizeof(aof_buf),
-                        "*3\r\n$3\r\nSET\r\n$%u\r\n%.*s\r\n$%u\r\n%.*s\r\n",
-                        (unsigned)msg.key_len, (int)msg.key_len, msg.key,
-                        (unsigned)msg.value_len, (int)msg.value_len, msg.value);
+                    int aof_len;
+                    if (msg.ttl_ms > 0) {
+                        // Include PX (milliseconds) flag with TTL
+                        aof_len = snprintf(aof_buf, sizeof(aof_buf),
+                            "*5\r\n$3\r\nSET\r\n$%u\r\n%.*s\r\n$%u\r\n%.*s\r\n$2\r\nPX\r\n$%zu\r\n%llu\r\n",
+                            (unsigned)msg.key_len, (int)msg.key_len, msg.key,
+                            (unsigned)msg.value_len, (int)msg.value_len, msg.value,
+                            std::to_string(msg.ttl_ms).size(), (unsigned long long)msg.ttl_ms);
+                    } else {
+                        // No TTL
+                        aof_len = snprintf(aof_buf, sizeof(aof_buf),
+                            "*3\r\n$3\r\nSET\r\n$%u\r\n%.*s\r\n$%u\r\n%.*s\r\n",
+                            (unsigned)msg.key_len, (int)msg.key_len, msg.key,
+                            (unsigned)msg.value_len, (int)msg.value_len, msg.value);
+                    }
                     [[maybe_unused]] auto _ = write(engine.aof_fd, aof_buf, aof_len);
                 }
                 
@@ -338,7 +348,7 @@ void run_reactor(int reactor_id, int physical_core_id)
                 conn->response_data.clear();
                 conn->pipeline_results.clear();
                 conn->pending_itc = 0;
-                bool has_set_command = false;
+                conn->aof_data.clear();  // Clear AOF data for this batch
                 int cmd_idx = 0;
                 uint64_t remote_signal_mask = 0;
 
@@ -389,14 +399,30 @@ void run_reactor(int reactor_id, int physical_core_id)
                         if (is_local) {
                             engine.set(cmd.args[0], cmd.args[1], ttl_ms);
                             
-                            // Prepare AOF
-                            conn->aof_len = snprintf(
-                                conn->aof_buf, sizeof(conn->aof_buf),
-                                "*3\r\n$3\r\nSET\r\n$%zu\r\n%.*s\r\n$%zu\r\n%.*s\r\n",
-                                cmd.args[0].size(), (int)cmd.args[0].size(), cmd.args[0].data(),
-                                cmd.args[1].size(), (int)cmd.args[1].size(), cmd.args[1].data());
+                            // Append to AOF with TTL if present
+                            char aof_entry[1024];
+                            int aof_len;
+                            if (ttl_ms > 0) {
+                                // Include PX (milliseconds) flag with TTL
+                                aof_len = snprintf(
+                                    aof_entry, sizeof(aof_entry),
+                                    "*5\r\n$3\r\nSET\r\n$%zu\r\n%.*s\r\n$%zu\r\n%.*s\r\n$2\r\nPX\r\n$%zu\r\n%llu\r\n",
+                                    cmd.args[0].size(), (int)cmd.args[0].size(), cmd.args[0].data(),
+                                    cmd.args[1].size(), (int)cmd.args[1].size(), cmd.args[1].data(),
+                                    std::to_string(ttl_ms).size(), (unsigned long long)ttl_ms);
+                            } else {
+                                // No TTL
+                                aof_len = snprintf(
+                                    aof_entry, sizeof(aof_entry),
+                                    "*3\r\n$3\r\nSET\r\n$%zu\r\n%.*s\r\n$%zu\r\n%.*s\r\n",
+                                    cmd.args[0].size(), (int)cmd.args[0].size(), cmd.args[0].data(),
+                                    cmd.args[1].size(), (int)cmd.args[1].size(), cmd.args[1].data());
+                            }
                             
-                            has_set_command = true;
+                            if (aof_len > 0) {
+                                conn->aof_data.append(aof_entry, aof_len);
+                            }
+                            
                             conn->pipeline_results.push_back("+OK\r\n");
                         } else {
                             // Forward SET to owner reactor via ITC
@@ -477,12 +503,12 @@ void run_reactor(int reactor_id, int physical_core_id)
                     }
                 }
 
-                if (has_set_command && conn->aof_len > 0 && conn->pending_itc == 0)
+                if (!conn->aof_data.empty() && conn->pending_itc == 0 && engine.aof_fd >= 0)
                 {
-                    // Write to AOF first (only if no pending ITC)
+                    // Write to AOF first (only if no pending ITC and AOF is valid)
                     conn->type = OpType::AOF_WRITE;
                     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-                    io_uring_prep_write(sqe, engine.aof_fd, conn->aof_buf, conn->aof_len, -1);
+                    io_uring_prep_write(sqe, engine.aof_fd, conn->aof_data.c_str(), conn->aof_data.size(), -1);
                     sqe->flags |= IOSQE_ASYNC;
                     io_uring_sqe_set_data(sqe, conn);
                 }
@@ -494,9 +520,20 @@ void run_reactor(int reactor_id, int physical_core_id)
         }
         else if (conn->type == OpType::AOF_WRITE)
         {
-            conn->aof_len = 0;
+            // Verify that the AOF write completed successfully
+            if (res < 0 || static_cast<size_t>(res) != conn->aof_data.size())
+            {
+                std::cerr << "AOF write failed or was partial on fd " << conn->fd
+                          << " (expected " << conn->aof_data.size() << " bytes, got " << res << ")\n";
+                fd_to_conn.erase(conn->fd);
+                close(conn->fd);
+                release_conn(conn);
+                io_uring_cqe_seen(&ring, cqe);
+                continue;
+            }
             
-            // Now send response to client
+            // AOF write succeeded; clear data and send response to client
+            conn->aof_data.clear();
             submit_response(conn);
         }
         else if (conn->type == OpType::WRITE)
