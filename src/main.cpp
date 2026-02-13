@@ -297,10 +297,19 @@ void run_reactor(int reactor_id, int physical_core_id)
         Connection *conn = (Connection *)io_uring_cqe_get_data(cqe);
         int res = cqe->res;
 
-        if (res < 0)
+        // Handle AOF_WRITE errors first (before generic res < 0 cleanup)
+        if (conn->type == OpType::AOF_WRITE && res < 0)
+        {
+            // AOF write failed - log and cleanup connection
+            fd_to_conn.erase(conn->fd);
+            close(conn->fd);
+            release_conn(conn);
+        }
+        else if (res < 0)
         {
             if (conn->type != OpType::ACCEPT) {
                 fd_to_conn.erase(conn->fd);
+                close(conn->fd);
                 release_conn(conn);
             }
         }
