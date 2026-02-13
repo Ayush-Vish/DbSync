@@ -5,6 +5,7 @@
 #include <stack>
 #include <thread>
 #include <unordered_map>
+#include <cstring>
 #include <liburing.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -24,6 +25,7 @@ int g_num_reactors = 1;
 const int PORT = 6379;
 const int QUEUE_DEPTH = 4096;
 const int MAX_CONN_PER_THREAD = 4096;
+const int AOF_BUFFER_SIZE = 1024;
 
 enum class OpType
 {
@@ -33,6 +35,33 @@ enum class OpType
     AOF_WRITE,
     ITC_EVENT  // eventfd read for ITC wakeup
 };
+
+// Helper function to format AOF entry for SET command
+// Returns the length of the formatted entry, or -1 if buffer too small
+int format_aof_set_entry(char* buffer, size_t buffer_size, 
+                         std::string_view key, std::string_view value, uint64_t ttl_ms) {
+    int result;
+    if (ttl_ms > 0) {
+        // Include PX (milliseconds) flag with TTL
+        result = snprintf(buffer, buffer_size,
+            "*5\r\n$3\r\nSET\r\n$%zu\r\n%.*s\r\n$%zu\r\n%.*s\r\n$2\r\nPX\r\n$%zu\r\n%llu\r\n",
+            key.size(), (int)key.size(), key.data(),
+            value.size(), (int)value.size(), value.data(),
+            std::to_string(ttl_ms).size(), (unsigned long long)ttl_ms);
+    } else {
+        // No TTL
+        result = snprintf(buffer, buffer_size,
+            "*3\r\n$3\r\nSET\r\n$%zu\r\n%.*s\r\n$%zu\r\n%.*s\r\n",
+            key.size(), (int)key.size(), key.data(),
+            value.size(), (int)value.size(), value.data());
+    }
+    
+    // Check for buffer overflow
+    if (result < 0 || static_cast<size_t>(result) >= buffer_size) {
+        return -1;  // Buffer too small or encoding error
+    }
+    return result;
+}
 
 struct Connection
 {
@@ -227,23 +256,17 @@ void run_reactor(int reactor_id, int physical_core_id)
                 
                 // Write to AOF for remote SETs with TTL if present
                 if (engine.aof_fd >= 0) {
-                    char aof_buf[1024];
-                    int aof_len;
-                    if (msg.ttl_ms > 0) {
-                        // Include PX (milliseconds) flag with TTL
-                        aof_len = snprintf(aof_buf, sizeof(aof_buf),
-                            "*5\r\n$3\r\nSET\r\n$%u\r\n%.*s\r\n$%u\r\n%.*s\r\n$2\r\nPX\r\n$%zu\r\n%llu\r\n",
-                            (unsigned)msg.key_len, (int)msg.key_len, msg.key,
-                            (unsigned)msg.value_len, (int)msg.value_len, msg.value,
-                            std::to_string(msg.ttl_ms).size(), (unsigned long long)msg.ttl_ms);
+                    char aof_buf[AOF_BUFFER_SIZE];
+                    int aof_len = format_aof_set_entry(aof_buf, sizeof(aof_buf),
+                        std::string_view(msg.key, msg.key_len),
+                        std::string_view(msg.value, msg.value_len),
+                        msg.ttl_ms);
+                    
+                    if (aof_len > 0) {
+                        [[maybe_unused]] auto _ = write(engine.aof_fd, aof_buf, aof_len);
                     } else {
-                        // No TTL
-                        aof_len = snprintf(aof_buf, sizeof(aof_buf),
-                            "*3\r\n$3\r\nSET\r\n$%u\r\n%.*s\r\n$%u\r\n%.*s\r\n",
-                            (unsigned)msg.key_len, (int)msg.key_len, msg.key,
-                            (unsigned)msg.value_len, (int)msg.value_len, msg.value);
+                        std::cerr << "Warning: AOF entry too large for remote SET, skipping\n";
                     }
-                    [[maybe_unused]] auto _ = write(engine.aof_fd, aof_buf, aof_len);
                 }
                 
                 ITCMessage resp;
@@ -400,27 +423,14 @@ void run_reactor(int reactor_id, int physical_core_id)
                             engine.set(cmd.args[0], cmd.args[1], ttl_ms);
                             
                             // Append to AOF with TTL if present
-                            char aof_entry[1024];
-                            int aof_len;
-                            if (ttl_ms > 0) {
-                                // Include PX (milliseconds) flag with TTL
-                                aof_len = snprintf(
-                                    aof_entry, sizeof(aof_entry),
-                                    "*5\r\n$3\r\nSET\r\n$%zu\r\n%.*s\r\n$%zu\r\n%.*s\r\n$2\r\nPX\r\n$%zu\r\n%llu\r\n",
-                                    cmd.args[0].size(), (int)cmd.args[0].size(), cmd.args[0].data(),
-                                    cmd.args[1].size(), (int)cmd.args[1].size(), cmd.args[1].data(),
-                                    std::to_string(ttl_ms).size(), (unsigned long long)ttl_ms);
-                            } else {
-                                // No TTL
-                                aof_len = snprintf(
-                                    aof_entry, sizeof(aof_entry),
-                                    "*3\r\n$3\r\nSET\r\n$%zu\r\n%.*s\r\n$%zu\r\n%.*s\r\n",
-                                    cmd.args[0].size(), (int)cmd.args[0].size(), cmd.args[0].data(),
-                                    cmd.args[1].size(), (int)cmd.args[1].size(), cmd.args[1].data());
-                            }
+                            char aof_entry[AOF_BUFFER_SIZE];
+                            int aof_len = format_aof_set_entry(aof_entry, sizeof(aof_entry),
+                                cmd.args[0], cmd.args[1], ttl_ms);
                             
                             if (aof_len > 0) {
                                 conn->aof_data.append(aof_entry, aof_len);
+                            } else {
+                                std::cerr << "Warning: AOF entry too large for local SET, skipping\n";
                             }
                             
                             conn->pipeline_results.push_back("+OK\r\n");
@@ -521,10 +531,21 @@ void run_reactor(int reactor_id, int physical_core_id)
         else if (conn->type == OpType::AOF_WRITE)
         {
             // Verify that the AOF write completed successfully
-            if (res < 0 || static_cast<size_t>(res) != conn->aof_data.size())
+            if (res < 0)
             {
-                std::cerr << "AOF write failed or was partial on fd " << conn->fd
-                          << " (expected " << conn->aof_data.size() << " bytes, got " << res << ")\n";
+                std::cerr << "AOF write error on fd " << conn->fd
+                          << ": " << strerror(-res) << " (errno " << -res << ")\n";
+                fd_to_conn.erase(conn->fd);
+                close(conn->fd);
+                release_conn(conn);
+                io_uring_cqe_seen(&ring, cqe);
+                continue;
+            }
+            else if (static_cast<size_t>(res) != conn->aof_data.size())
+            {
+                std::cerr << "AOF partial write on fd " << conn->fd
+                          << ": expected " << conn->aof_data.size() 
+                          << " bytes, wrote " << res << " bytes\n";
                 fd_to_conn.erase(conn->fd);
                 close(conn->fd);
                 release_conn(conn);
