@@ -223,7 +223,12 @@ void run_reactor(int reactor_id, int physical_core_id)
             }
             if (!has_content)
             {
-                // All results are empty (shouldn't happen if pending_itc check works)
+                // All results are empty, which can happen if there's a logic error
+                // in ITC handling. Instead of stalling, schedule a new read.
+                c->type = OpType::READ;
+                struct io_uring_sqe *sqe = io_uring_get_sqe(˚);
+                io_uring_prep_read(sqe, c->fd, c->buffer, 4096, 0);
+                io_uring_sqe_set_data(sqe, c);
                 return;
             }
             c->pipeline_results.clear();
