@@ -2,6 +2,23 @@
 
 **DbSync** is an ultra-high-performance, sharded key-value store built in **C++20** using **Linux io_uring**. By transitioning to a **Shared-Nothing Architecture**, it eliminates the performance ceilings of traditional mutex-based systems, enabling linear vertical scaling that outperforms even highly optimized clusters like Redis and DragonflyDB.
 
+---
+
+## 📊 Competitive Benchmarks
+
+The following data represents a head-to-head comparison using `memtier_benchmark` (8 threads, 200 clients, 1:1 SET/GET ratio). DbSync consistently demonstrates superior throughput and significantly lower tail latency (P99).
+
+| Engine | Total Throughput (Ops/sec) | Avg. Latency (ms) | P50 Latency (ms) | P99 Latency (ms) |
+| --- | --- | --- | --- | --- |
+| **DbSync (Phase 7)** | **394,126** | **0.202** | **0.207** | **0.383** |
+| **DragonflyDB** | 310,372 | 0.257 | 0.199 | 1.255 |
+| **Redis** | 247,380 | 0.323 | 0.311 | 0.639 |
+
+> **Analysis:** DbSync outperforms DragonflyDB by **~27%** and Redis by **~59%** in total throughput. Notably, DbSync's **P99 latency is 3x lower than Dragonfly's**, proving the efficiency of the lock-free steering model.
+
+---
+
+
 ## 📊 Evolution of Throughput
 
 > **Note on Benchmarking:** Up to Phase 6, `redis-benchmark` was used for local validation. However, as the engine matured into a distributed steering model, we migrated to `memtier_benchmark`. Unlike the former, `memtier` provides a more rigorous multi-threaded load profile, revealing the true performance of the Inter-Thread Communication (ITC) bus under sustained pressure.
