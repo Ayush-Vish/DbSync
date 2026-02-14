@@ -29,16 +29,17 @@ struct alignas(64) ITCMessage {
     int sender_reactor;
     int conn_fd;              // Which connection this is for
     int pipeline_idx;         // Position in pipelined response
+    uint32_t conn_gen;        // Connection generation to detect stale responses
     
     static constexpr size_t MAX_KEY_SIZE = 128;
     static constexpr size_t MAX_VALUE_SIZE = 384;
     
     char key[MAX_KEY_SIZE];
     char value[MAX_VALUE_SIZE];
-    uint16_t key_len;
-    uint16_t value_len;
-    uint64_t ttl_ms;
-    bool found;               // For RESP: was key found?
+    uint16_t key_len = 0;
+    uint16_t value_len = 0;
+    uint64_t ttl_ms = 0;
+    bool found = false;       // For RESP: was key found?
     
     void set_key(std::string_view k) {
         key_len = std::min(k.size(), MAX_KEY_SIZE - 1);

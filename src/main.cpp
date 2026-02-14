@@ -31,13 +31,14 @@ enum class OpType
     READ,
     WRITE,
     AOF_WRITE,
-    ITC_EVENT  // eventfd read for ITC wakeup
+    ITC_EVENT // eventfd read for ITC wakeup
 };
 
 struct Connection
 {
     int fd;
     OpType type;
+    uint32_t generation = 0;   // Incremented on each reuse to detect stale ITC responses
     char buffer[4096];
     std::string response_data;
 
@@ -46,15 +47,16 @@ struct Connection
     uint32_t aof_len = 0;
 
     // ITC tracking for shared-nothing architecture
-    int pending_itc = 0;                        // Outstanding ITC requests
-    std::vector<std::string> pipeline_results;  // Indexed results for pipelining
-    int expected_results = 0;                   // Total results expected
-    bool suspended = false;                     // Waiting for ITC responses
-    int owner_reactor = -1;                     // Which reactor owns this connection
+    int pending_itc = 0;                       // Outstanding ITC requests
+    std::vector<std::string> pipeline_results; // Indexed results for pipelining
+    int expected_results = 0;                  // Total results expected
+    bool suspended = false;                    // Waiting for ITC responses
+    int owner_reactor = -1;                    // Which reactor owns this connection
 
     void reset()
     {
         fd = -1;
+        generation++;  // Increment generation so stale ITC responses are rejected
         response_data.clear();
         aof_len = 0;
         pending_itc = 0;
@@ -73,7 +75,7 @@ int create_shared_socket()
         perror("socket failed");
         return -1;
     }
-    
+
     int opt = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
     {
@@ -92,7 +94,7 @@ int create_shared_socket()
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(PORT);
-    
+
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
         perror("Bind failed");
@@ -142,12 +144,12 @@ void run_reactor(int reactor_id, int physical_core_id)
     };
 
     // Map fd -> Connection* for ITC response handling
-    std::unordered_map<int, Connection*> fd_to_conn;
+    std::unordered_map<int, Connection *> fd_to_conn;
 
     struct io_uring ring;
     io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
     int thread_socket = create_shared_socket();
-    
+
     if (thread_socket < 0)
     {
         std::cerr << "Reactor " << reactor_id << ": Failed to create socket." << std::endl;
@@ -169,52 +171,74 @@ void run_reactor(int reactor_id, int physical_core_id)
     submit_accept();
 
     // Register eventfd with io_uring for ITC wakeup
-    Connection* itc_conn = get_conn();
-    if (itc_conn) {
+    Connection *itc_conn = get_conn();
+    if (itc_conn)
+    {
         itc_conn->fd = g_itc.get_event_fd(reactor_id);
         itc_conn->type = OpType::ITC_EVENT;
     }
-    
+
     // Buffer for eventfd reads
     static thread_local uint64_t eventfd_buf;
-    
-    auto submit_itc_read = [&]() {
-        if (itc_conn) {
+
+    auto submit_itc_read = [&]()
+    {
+        if (itc_conn)
+        {
             struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
             io_uring_prep_read(sqe, itc_conn->fd, &eventfd_buf, sizeof(eventfd_buf), 0);
             io_uring_sqe_set_data(sqe, itc_conn);
         }
     };
-    
+
     submit_itc_read();
 
     // Helper to format bulk string response
-    auto format_bulk = [](std::string_view val) -> std::string {
+    auto format_bulk = [](std::string_view val) -> std::string
+    {
         return "$" + std::to_string(val.size()) + "\r\n" + std::string(val) + "\r\n";
     };
 
     // Helper to submit response when connection is ready
-    auto submit_response = [&](Connection* c) {
-        if (c->pending_itc > 0) {
+    auto submit_response = [&](Connection *c)
+    {
+        if (c->pending_itc > 0)
+        {
             c->suspended = true;
             return; // Wait for ITC responses
         }
-        
+
         // Build response from pipeline results if we have them
-        if (!c->pipeline_results.empty()) {
+        if (!c->pipeline_results.empty())
+        {
             c->response_data.clear();
-            for (const auto& r : c->pipeline_results) {
-                c->response_data += r;
+            bool has_content = false;
+            for (const auto &r : c->pipeline_results)
+            {
+                if (!r.empty())
+                { // <-- ADD THIS CHECK
+                    c->response_data += r;
+                    has_content = true;
+                }
+            }
+            if (!has_content)
+            {
+                // All results are empty (shouldn't happen if pending_itc check works)
+                return;
             }
             c->pipeline_results.clear();
         }
-        
-        if (!c->response_data.empty()) {
+
+        if (!c->response_data.empty())
+        {
             c->type = OpType::WRITE;
             struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-            io_uring_prep_send(sqe, c->fd, c->response_data.c_str(), c->response_data.size(), 0);
+            io_uring_prep_send(sqe, c->fd, c->response_data.c_str(),
+                               c->response_data.size(), 0);
             io_uring_sqe_set_data(sqe, c);
-        } else {
+        }
+        else
+        {
             c->type = OpType::READ;
             struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
             io_uring_prep_read(sqe, c->fd, c->buffer, 4096, 0);
@@ -226,86 +250,145 @@ void run_reactor(int reactor_id, int physical_core_id)
     {
         // ========== PHASE 1: Drain ITC Inbox ==========
         uint64_t signal_mask = 0;
-        
+
         ITCMessage msg;
-        while (g_itc.pop(reactor_id, msg)) {
-            if (msg.type == ITCMessage::Type::GET_REQ) {
+        while (g_itc.pop(reactor_id, msg))
+        {
+            if (msg.type == ITCMessage::Type::GET_REQ)
+            {
                 // Process GET request from another reactor
+                // std::cout << "[ITC] Reactor " << reactor_id << " received GET_REQ for key '" 
+                //           << msg.get_key() << "' from Reactor " << msg.sender_reactor 
+                //           << " (fd=" << msg.conn_fd << ", idx=" << msg.pipeline_idx << ")" << std::endl;
+
                 auto result = engine.get(msg.get_key());
-                
+
                 ITCMessage resp;
                 resp.type = ITCMessage::Type::RESP;
                 resp.sender_reactor = reactor_id;
                 resp.conn_fd = msg.conn_fd;
+                resp.conn_gen = msg.conn_gen;  // Preserve connection generation
                 resp.pipeline_idx = msg.pipeline_idx;
                 resp.found = result.has_value();
-                if (result) resp.set_value(*result);
-                
+                resp.value_len = 0;  // Explicit init before optional set_value
+                if (result)
+                    resp.set_value(*result);
+
+                // std::cout << "[ITC] Reactor " << reactor_id << " sending RESP to Reactor " 
+                //           << msg.sender_reactor << " (found=" << resp.found 
+                //           << ", value='" << resp.get_value() << "')" << std::endl;
+
                 g_itc.push(msg.sender_reactor, resp);
                 signal_mask |= (1ULL << msg.sender_reactor);
             }
-            else if (msg.type == ITCMessage::Type::SET_REQ) {
+            else if (msg.type == ITCMessage::Type::SET_REQ)
+            {
                 // Process SET request from another reactor
+                // std::cout << "[ITC] Reactor " << reactor_id << " received SET_REQ for key '" 
+                //           << msg.get_key() << "' = '" << msg.get_value() << "' from Reactor " 
+                //           << msg.sender_reactor << " (fd=" << msg.conn_fd << ")" << std::endl;
+
                 engine.set(msg.get_key(), msg.get_value(), msg.ttl_ms);
-                
+
                 // Write to AOF for remote SETs
-                if (engine.aof_fd >= 0) {
+                if (engine.aof_fd >= 0)
+                {
                     char aof_buf[1024];
                     int aof_len = snprintf(aof_buf, sizeof(aof_buf),
-                        "*3\r\n$3\r\nSET\r\n$%u\r\n%.*s\r\n$%u\r\n%.*s\r\n",
-                        (unsigned)msg.key_len, (int)msg.key_len, msg.key,
-                        (unsigned)msg.value_len, (int)msg.value_len, msg.value);
+                                           "*3\r\n$3\r\nSET\r\n$%u\r\n%.*s\r\n$%u\r\n%.*s\r\n",
+                                           (unsigned)msg.key_len, (int)msg.key_len, msg.key,
+                                           (unsigned)msg.value_len, (int)msg.value_len, msg.value);
                     [[maybe_unused]] auto _ = write(engine.aof_fd, aof_buf, aof_len);
                 }
-                
+
                 ITCMessage resp;
                 resp.type = ITCMessage::Type::RESP;
                 resp.sender_reactor = reactor_id;
                 resp.conn_fd = msg.conn_fd;
+                resp.conn_gen = msg.conn_gen;  // Preserve connection generation
                 resp.pipeline_idx = msg.pipeline_idx;
                 resp.found = true;
-                // For SET, found=true means success, value not used
-                
+                resp.value_len = 0;  // Explicit: SET response has no value
+
+                // std::cout << "[ITC] Reactor " << reactor_id << " sending SET RESP to Reactor " 
+                //           << msg.sender_reactor << " (OK)" << std::endl;
+
                 g_itc.push(msg.sender_reactor, resp);
                 signal_mask |= (1ULL << msg.sender_reactor);
             }
-            else if (msg.type == ITCMessage::Type::RESP) {
+
+            else if (msg.type == ITCMessage::Type::RESP)
+            {
                 // Response came back for our request
+                // std::cout << "[ITC] Reactor " << reactor_id << " received RESP from Reactor " 
+                //           << msg.sender_reactor << " (fd=" << msg.conn_fd << ", idx=" 
+                //           << msg.pipeline_idx << ", found=" << msg.found 
+                //           << ", value='" << msg.get_value() << "')" << std::endl;
+
                 auto it = fd_to_conn.find(msg.conn_fd);
-                if (it != fd_to_conn.end()) {
-                    Connection* c = it->second;
-                    
-                    // Store result at correct pipeline position
-                    if (msg.pipeline_idx < (int)c->pipeline_results.size()) {
-                        // Check the original request type from the placeholder
-                        // For SET response: +OK\r\n, for GET: bulk string or nil
-                        if (msg.found) {
-                            std::string_view val = msg.get_value();
-                            if (val.empty()) {
-                                // SET response (found=true, no value means OK)
-                                c->pipeline_results[msg.pipeline_idx] = "+OK\r\n";
-                            } else {
-                                c->pipeline_results[msg.pipeline_idx] = format_bulk(val);
-                            }
-                        } else {
-                            c->pipeline_results[msg.pipeline_idx] = "$-1\r\n";
+                if (it != fd_to_conn.end())
+                {
+                    Connection *c = it->second;
+
+                    // ===== CRITICAL FIX: Validate connection state =====
+                    // Check if:
+                    // 1. Connection pointer is valid
+                    // 2. FD matches (not recycled to different socket)
+                    // 3. Generation matches (detects fd reuse)
+                    // 4. Connection is still waiting for ITC responses
+                    // 5. Pipeline index is valid
+                    if (c == nullptr || c->fd != msg.conn_fd || 
+                        c->generation != msg.conn_gen || c->pending_itc <= 0)
+                    {
+                        // Stale response - connection was recycled/closed
+                        // std::cout << "[ITC] STALE RESP discarded: fd=" << msg.conn_fd 
+                        //           << " gen_msg=" << msg.conn_gen << " gen_conn=" << c->generation
+                        //           << " pending=" << c->pending_itc << std::endl;
+                        continue;
+                    }
+
+                    // Bounds check before accessing pipeline_results
+                    if (msg.pipeline_idx < 0 || msg.pipeline_idx >= (int)c->pipeline_results.size())
+                    {
+                        // Invalid pipeline index - connection state changed
+                        continue;
+                    }
+
+                    // Now safe to store result at correct pipeline position
+                    if (msg.found)
+                    {
+                        std::string_view val = msg.get_value();
+                        if (val.empty())
+                        {
+                            c->pipeline_results[msg.pipeline_idx] = "+OK\r\n";
+                        }
+                        else
+                        {
+                            c->pipeline_results[msg.pipeline_idx] = format_bulk(val);
                         }
                     }
-                    
+                    else
+                    {
+                        c->pipeline_results[msg.pipeline_idx] = "$-1\r\n";
+                    }
+
                     c->pending_itc--;
-                    
+
                     // Check if all ITC responses are in
-                    if (c->pending_itc == 0 && c->suspended) {
+                    if (c->pending_itc == 0 && c->suspended)
+                    {
                         c->suspended = false;
                         submit_response(c);
                     }
                 }
             }
         }
-        
+
         // Batch signal all reactors we messaged
-        for (int i = 0; i < g_num_reactors; i++) {
-            if (signal_mask & (1ULL << i)) {
+        for (int i = 0; i < g_num_reactors; i++)
+        {
+            if (signal_mask & (1ULL << i))
+            {
                 g_itc.signal(i);
             }
         }
@@ -329,7 +412,8 @@ void run_reactor(int reactor_id, int physical_core_id)
         }
         else if (res < 0)
         {
-            if (conn->type != OpType::ACCEPT) {
+            if (conn->type != OpType::ACCEPT)
+            {
                 fd_to_conn.erase(conn->fd);
                 close(conn->fd);
                 release_conn(conn);
@@ -343,7 +427,7 @@ void run_reactor(int reactor_id, int physical_core_id)
                 client->fd = res;
                 client->type = OpType::READ;
                 client->owner_reactor = reactor_id;
-                fd_to_conn[res] = client;  // Register for ITC lookups
+                fd_to_conn[res] = client; // Register for ITC lookups
                 struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
                 io_uring_prep_read(sqe, client->fd, client->buffer, 4096, 0);
                 io_uring_sqe_set_data(sqe, client);
@@ -382,7 +466,8 @@ void run_reactor(int reactor_id, int physical_core_id)
 
                     // Determine key ownership for GET/SET commands
                     std::string_view key;
-                    if ((cmd.type == "GET" || cmd.type == "SET") && !cmd.args.empty()) {
+                    if ((cmd.type == "GET" || cmd.type == "SET") && !cmd.args.empty())
+                    {
                         key = cmd.args[0];
                     }
 
@@ -417,39 +502,48 @@ void run_reactor(int reactor_id, int physical_core_id)
                             std::from_chars(cmd.args[2].data(), cmd.args[2].data() + cmd.args[2].size(), ttl_ms);
                         }
 
-                        if (is_local) {
+                        if (is_local)
+                        {
                             engine.set(cmd.args[0], cmd.args[1], ttl_ms);
-                            
+
                             // Prepare AOF
                             conn->aof_len = snprintf(
                                 conn->aof_buf, sizeof(conn->aof_buf),
                                 "*3\r\n$3\r\nSET\r\n$%zu\r\n%.*s\r\n$%zu\r\n%.*s\r\n",
                                 cmd.args[0].size(), (int)cmd.args[0].size(), cmd.args[0].data(),
                                 cmd.args[1].size(), (int)cmd.args[1].size(), cmd.args[1].data());
-                            
+
                             has_set_command = true;
                             conn->pipeline_results.push_back("+OK\r\n");
-                        } else {
+                        }
+                        else
+                        {
                             // Forward SET to owner reactor via ITC
+                            // std::cout << "[ITC] Reactor " << reactor_id << " forwarding SET '" 
+                            //           << cmd.args[0] << "' = '" << cmd.args[1] << "' to owner Reactor " 
+                            //           << owner << " (fd=" << conn->fd << ")" << std::endl;
+
                             ITCMessage itc_msg;
                             itc_msg.type = ITCMessage::Type::SET_REQ;
                             itc_msg.sender_reactor = reactor_id;
                             itc_msg.conn_fd = conn->fd;
+                            itc_msg.conn_gen = conn->generation;  // Include generation
                             itc_msg.pipeline_idx = cmd_idx;
                             itc_msg.set_key(cmd.args[0]);
                             itc_msg.set_value(cmd.args[1]);
                             itc_msg.ttl_ms = ttl_ms;
-                            
+
                             g_itc.push(owner, itc_msg);
                             remote_signal_mask |= (1ULL << owner);
-                            
+
                             conn->pending_itc++;
-                            conn->pipeline_results.push_back("");  // Placeholder
+                            conn->pipeline_results.push_back(""); // Placeholder
                         }
                     }
                     else if (cmd.type == "GET" && !cmd.args.empty())
                     {
-                        if (is_local) {
+                        if (is_local)
+                        {
                             auto val = engine.get(cmd.args[0]);
                             if (val)
                             {
@@ -459,20 +553,27 @@ void run_reactor(int reactor_id, int physical_core_id)
                             {
                                 conn->pipeline_results.push_back("$-1\r\n");
                             }
-                        } else {
+                        }
+                        else
+                        {
                             // Forward GET to owner reactor via ITC
+                            // std::cout << "[ITC] Reactor " << reactor_id << " forwarding GET '" 
+                            //           << cmd.args[0] << "' to owner Reactor " << owner 
+                            //           << " (fd=" << conn->fd << ")" << std::endl;
+
                             ITCMessage itc_msg;
                             itc_msg.type = ITCMessage::Type::GET_REQ;
                             itc_msg.sender_reactor = reactor_id;
                             itc_msg.conn_fd = conn->fd;
+                            itc_msg.conn_gen = conn->generation;  // Include generation
                             itc_msg.pipeline_idx = cmd_idx;
                             itc_msg.set_key(cmd.args[0]);
-                            
+
                             g_itc.push(owner, itc_msg);
                             remote_signal_mask |= (1ULL << owner);
-                            
+
                             conn->pending_itc++;
-                            conn->pipeline_results.push_back("");  // Placeholder
+                            conn->pipeline_results.push_back(""); // Placeholder
                         }
                     }
                     else if (cmd.type == "CONFIG")
@@ -502,8 +603,10 @@ void run_reactor(int reactor_id, int physical_core_id)
                 conn->expected_results = cmd_idx;
 
                 // Batch signal remote reactors
-                for (int i = 0; i < g_num_reactors; i++) {
-                    if (remote_signal_mask & (1ULL << i)) {
+                for (int i = 0; i < g_num_reactors; i++)
+                {
+                    if (remote_signal_mask & (1ULL << i))
+                    {
                         g_itc.signal(i);
                     }
                 }
@@ -526,7 +629,7 @@ void run_reactor(int reactor_id, int physical_core_id)
         else if (conn->type == OpType::AOF_WRITE)
         {
             conn->aof_len = 0;
-            
+
             // Now send response to client
             submit_response(conn);
         }
@@ -565,7 +668,7 @@ int main()
     std::cout << "🔥 DbSync Phase 6: Shared-Nothing Dragonfly Architecture" << std::endl;
     std::cout << "🚀 Core Pinning: Using " << num_reactors << " Physical Cores" << std::endl;
     std::cout << "📡 ITC: moodycamel ConcurrentQueue (" << num_reactors << " inboxes)" << std::endl;
-    
+
     for (int i = 0; i < num_reactors; ++i)
     {
         int physical_core = i * 2;
