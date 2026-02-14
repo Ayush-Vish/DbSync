@@ -10,3 +10,7 @@ build/
 # Ignore database files
 data/
 logs/
+main
+*.out
+*.o
+*.exe
