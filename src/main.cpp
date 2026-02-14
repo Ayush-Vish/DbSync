@@ -1,8 +1,4 @@
 #include <iostream>
-#include <vector>
-#include <string>
-#include <string_view>
-#include <stack>
 #include <thread>
 #include <unordered_map>
 #include <liburing.h>
@@ -10,60 +6,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <charconv>
 
-#include "../include/dbsync_engine.hpp"
-#include "../include/resp_parser.hpp"
-#include "../include/debug.hpp"
+#include "../include/connection.hpp"
+#include "../include/command_handler.hpp"
 #include "../include/itc_queue.hpp"
 
 // Global ITC context shared by all reactors
 ITCContext g_itc;
 int g_num_reactors = 1;
-
-const int PORT = 6379;
-const int QUEUE_DEPTH = 4096;
-const int MAX_CONN_PER_THREAD = 4096;
-
-enum class OpType
-{
-    ACCEPT,
-    READ,
-    WRITE,
-    AOF_WRITE,
-    ITC_EVENT  // eventfd read for ITC wakeup
-};
-
-struct Connection
-{
-    int fd;
-    OpType type;
-    char buffer[4096];
-    std::string response_data;
-
-    // AOF buffer
-    char aof_buf[1024];
-    uint32_t aof_len = 0;
-
-    // ITC tracking for shared-nothing architecture
-    int pending_itc = 0;                        // Outstanding ITC requests
-    std::vector<std::string> pipeline_results;  // Indexed results for pipelining
-    int expected_results = 0;                   // Total results expected
-    bool suspended = false;                     // Waiting for ITC responses
-    int owner_reactor = -1;                     // Which reactor owns this connection
-
-    void reset()
-    {
-        fd = -1;
-        response_data.clear();
-        aof_len = 0;
-        pending_itc = 0;
-        pipeline_results.clear();
-        expected_results = 0;
-        suspended = false;
-        owner_reactor = -1;
-    }
-};
 
 int create_shared_socket()
 {
@@ -118,28 +68,7 @@ void run_reactor(int reactor_id, int physical_core_id)
     // Shared-nothing: each reactor owns its partition of the global keyspace
     DbSyncEngine engine(512, reactor_id, g_num_reactors);
 
-    std::vector<Connection> conn_pool(MAX_CONN_PER_THREAD);
-    std::stack<int> free_indices;
-    for (int i = 0; i < MAX_CONN_PER_THREAD; ++i)
-    {
-        conn_pool[i].reset();
-        free_indices.push(i);
-    }
-
-    auto get_conn = [&]() -> Connection *
-    {
-        if (free_indices.empty())
-            return nullptr;
-        int idx = free_indices.top();
-        free_indices.pop();
-        return &conn_pool[idx];
-    };
-
-    auto release_conn = [&](Connection *conn)
-    {
-        conn->reset();
-        free_indices.push(conn - &conn_pool[0]);
-    };
+    ConnectionPool conn_pool(MAX_CONN_PER_THREAD);
 
     // Map fd -> Connection* for ITC response handling
     std::unordered_map<int, Connection*> fd_to_conn;
@@ -156,7 +85,7 @@ void run_reactor(int reactor_id, int physical_core_id)
 
     auto submit_accept = [&]()
     {
-        Connection *conn = get_conn();
+        Connection *conn = conn_pool.acquire();
         if (!conn)
             return;
         conn->fd = thread_socket;
@@ -169,7 +98,7 @@ void run_reactor(int reactor_id, int physical_core_id)
     submit_accept();
 
     // Register eventfd with io_uring for ITC wakeup
-    Connection* itc_conn = get_conn();
+    Connection* itc_conn = conn_pool.acquire();
     if (itc_conn) {
         itc_conn->fd = g_itc.get_event_fd(reactor_id);
         itc_conn->type = OpType::ITC_EVENT;
@@ -188,10 +117,7 @@ void run_reactor(int reactor_id, int physical_core_id)
     
     submit_itc_read();
 
-    // Helper to format bulk string response
-    auto format_bulk = [](std::string_view val) -> std::string {
-        return "$" + std::to_string(val.size()) + "\r\n" + std::string(val) + "\r\n";
-    };
+    // Use resp::bulk from command_handler.hpp for formatting
 
     // Helper to submit response when connection is ready
     auto submit_response = [&](Connection* c) {
@@ -246,7 +172,7 @@ void run_reactor(int reactor_id, int physical_core_id)
             }
             else if (msg.type == ITCMessage::Type::SET_REQ) {
                 // Process SET request from another reactor
-                engine.set(msg.get_key(), msg.get_value(), msg.ttl_ms);
+                process_local_set(engine, msg.get_key(), msg.get_value(), msg.ttl_ms);
                 
                 // Write to AOF for remote SETs
                 if (engine.aof_fd >= 0) {
@@ -282,13 +208,12 @@ void run_reactor(int reactor_id, int physical_core_id)
                         if (msg.found) {
                             std::string_view val = msg.get_value();
                             if (val.empty()) {
-                                // SET response (found=true, no value means OK)
-                                c->pipeline_results[msg.pipeline_idx] = "+OK\r\n";
+                                c->pipeline_results[msg.pipeline_idx] = std::string(resp::OK);
                             } else {
-                                c->pipeline_results[msg.pipeline_idx] = format_bulk(val);
+                                c->pipeline_results[msg.pipeline_idx] = resp::bulk(val);
                             }
                         } else {
-                            c->pipeline_results[msg.pipeline_idx] = "$-1\r\n";
+                            c->pipeline_results[msg.pipeline_idx] = std::string(resp::NIL);
                         }
                     }
                     
@@ -325,19 +250,19 @@ void run_reactor(int reactor_id, int physical_core_id)
             // AOF write failed - log and cleanup connection
             fd_to_conn.erase(conn->fd);
             close(conn->fd);
-            release_conn(conn);
+            conn_pool.release(conn);
         }
         else if (res < 0)
         {
             if (conn->type != OpType::ACCEPT) {
                 fd_to_conn.erase(conn->fd);
                 close(conn->fd);
-                release_conn(conn);
+                conn_pool.release(conn);
             }
         }
         else if (conn->type == OpType::ACCEPT)
         {
-            Connection *client = get_conn();
+            Connection *client = conn_pool.acquire();
             if (client)
             {
                 client->fd = res;
@@ -360,7 +285,7 @@ void run_reactor(int reactor_id, int physical_core_id)
             {
                 fd_to_conn.erase(conn->fd);
                 close(conn->fd);
-                release_conn(conn);
+                conn_pool.release(conn);
             }
             else
             {
@@ -391,31 +316,7 @@ void run_reactor(int reactor_id, int physical_core_id)
 
                     if (cmd.type == "SET" && cmd.args.size() >= 2)
                     {
-                        uint64_t ttl_ms = 0;
-                        if (cmd.args.size() >= 4)
-                        {
-                            std::string_view flag = cmd.args[2];
-                            std::string_view timeout = cmd.args[3];
-                            uint64_t val = 0;
-
-                            auto [ptr, ec] = std::from_chars(timeout.data(), timeout.data() + timeout.size(), val);
-
-                            if (ec == std::errc())
-                            {
-                                if (flag == "EX" || flag == "ex")
-                                {
-                                    ttl_ms = val * 1000;
-                                }
-                                else if (flag == "PX" || flag == "px")
-                                {
-                                    ttl_ms = val;
-                                }
-                            }
-                        }
-                        else if (cmd.args.size() == 3)
-                        {
-                            std::from_chars(cmd.args[2].data(), cmd.args[2].data() + cmd.args[2].size(), ttl_ms);
-                        }
+                        uint64_t ttl_ms = parse_ttl(cmd);
 
                         if (is_local) {
                             engine.set(cmd.args[0], cmd.args[1], ttl_ms);
@@ -428,7 +329,7 @@ void run_reactor(int reactor_id, int physical_core_id)
                                 cmd.args[1].size(), (int)cmd.args[1].size(), cmd.args[1].data());
                             
                             has_set_command = true;
-                            conn->pipeline_results.push_back("+OK\r\n");
+                            conn->pipeline_results.push_back(std::string(resp::OK));
                         } else {
                             // Forward SET to owner reactor via ITC
                             ITCMessage itc_msg;
@@ -453,11 +354,11 @@ void run_reactor(int reactor_id, int physical_core_id)
                             auto val = engine.get(cmd.args[0]);
                             if (val)
                             {
-                                conn->pipeline_results.push_back(format_bulk(*val));
+                                conn->pipeline_results.push_back(resp::bulk(*val));
                             }
                             else
                             {
-                                conn->pipeline_results.push_back("$-1\r\n");
+                                conn->pipeline_results.push_back(std::string(resp::NIL));
                             }
                         } else {
                             // Forward GET to owner reactor via ITC
@@ -477,7 +378,7 @@ void run_reactor(int reactor_id, int physical_core_id)
                     }
                     else if (cmd.type == "CONFIG")
                     {
-                        conn->pipeline_results.push_back("*0\r\n");
+                        conn->pipeline_results.push_back(std::string(resp::EMPTY_ARRAY));
                     }
                     else if (cmd.type == "EXPIRE" && cmd.args.size() >= 2)
                     {
@@ -488,11 +389,11 @@ void run_reactor(int reactor_id, int physical_core_id)
                     }
                     else if (cmd.type == "PING")
                     {
-                        conn->pipeline_results.push_back("+PONG\r\n");
+                        conn->pipeline_results.push_back(std::string(resp::PONG));
                     }
                     else
                     {
-                        conn->pipeline_results.push_back("-ERR unknown command\r\n");
+                        conn->pipeline_results.push_back(std::string(resp::ERR_UNKNOWN));
                     }
 
                     remaining.remove_prefix(consumed);
