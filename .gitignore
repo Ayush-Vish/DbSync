@@ -1,4 +1,4 @@
-.rdb
+*.rdb
 *.aof
 *.log
 *.pid
@@ -14,3 +14,4 @@ main
 *.out
 *.o
 *.exe
+*.dfs

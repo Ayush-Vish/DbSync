@@ -10,6 +10,7 @@
 #include "../include/connection.hpp"
 #include "../include/command_handler.hpp"
 #include "../include/itc_queue.hpp"
+#include "../include/utils.hpp"
 
 // Global ITC context shared by all reactors
 ITCContext g_itc;
@@ -463,10 +464,8 @@ int main()
     g_itc.init(num_reactors);
 
     std::vector<std::thread> threads;
-    std::cout << "🔥 DbSync Phase 6: Shared-Nothing Dragonfly Architecture" << std::endl;
-    std::cout << "🚀 Core Pinning: Using " << num_reactors << " Physical Cores" << std::endl;
-    std::cout << "📡 ITC: moodycamel ConcurrentQueue (" << num_reactors << " inboxes)" << std::endl;
-    
+    print_cli();
+
     for (int i = 0; i < num_reactors; ++i)
     {
         int physical_core = i * 2;
