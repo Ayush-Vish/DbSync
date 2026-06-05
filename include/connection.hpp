@@ -26,10 +26,6 @@ struct Connection
     char buffer[4096];
     std::string response_data;
 
-    // AOF buffer
-    char aof_buf[1024];
-    uint32_t aof_len = 0;
-
     // ITC tracking for shared-nothing architecture
     int pending_itc = 0;
     std::vector<std::string> pipeline_results;
@@ -41,7 +37,6 @@ struct Connection
     {
         fd = -1;
         response_data.clear();
-        aof_len = 0;
         pending_itc = 0;
         pipeline_results.clear();
         expected_results = 0;

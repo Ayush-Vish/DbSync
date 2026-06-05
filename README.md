@@ -10,11 +10,11 @@ The following data represents a head-to-head comparison using `memtier_benchmark
 
 | Engine | Total Throughput (Ops/sec) | Avg. Latency (ms) | P50 Latency (ms) | P99 Latency (ms) |
 | --- | --- | --- | --- | --- |
-| **DbSync (Phase 7)** | **394,126** | **0.202** | **0.207** | **0.383** |
-| **DragonflyDB** | 310,372 | 0.257 | 0.199 | 1.255 |
-| **Redis** | 247,380 | 0.323 | 0.311 | 0.639 |
+| **DbSync (Async AOF)** | **2,140,143** | **11.95** | **10.56** | **34.05** |
+| **Redis** | 1,225,170 | 20.89 | 19.58 | 41.47 |
+| **DragonflyDB** | 1,161,721 | 22.02 | 18.30 | 75.78 |
 
-> **Analysis:** DbSync outperforms DragonflyDB by **~27%** and Redis by **~59%** in total throughput. Notably, DbSync's **P99 latency is 3x lower than Dragonfly's**, proving the efficiency of the lock-free steering model.
+> **Analysis:** DbSync outperforms Redis by **~75%** and DragonflyDB by **~84%** in total throughput. Notably, DbSync's **P99 latency is ~2.2x lower than Dragonfly's**, proving the efficiency of the lock-free steering model combined with batched, non-blocking AOF persistence.
 
 ---
 
@@ -31,7 +31,8 @@ The following data represents a head-to-head comparison using `memtier_benchmark
 | **Phase 4** | Multi-Reactor | Horizontal Scaling | 265,000 RPS | 4.27 ms |
 | **Phase 5** | Zero-Alloc | Object/Connection Pooling | 332,889 RPS | 0.93 ms |
 | **Phase 6** | Shared-Nothing | Lock-Free Local Engines | 3,944,773 RPS* | 1.89 ms |
-| **Phase 7** | **Distributed Steering** | **SPSC Request Hopping** | **365,825 RPS** | **0.79 ms** |
+| **Phase 7** | Distributed Steering | SPSC Request Hopping | 365,825 RPS | 0.79 ms |
+| **Phase 8** | **Async Batched AOF** | **Non-Blocking io_uring Persistence** | **2,140,143 Ops/sec** | **34.05 ms** |
 
 **Phase 6 throughput reflects independent local shards without cross-core consistency logic.*
 
@@ -54,10 +55,16 @@ The following data represents a head-to-head comparison using `memtier_benchmark
 * **The Problem:** Cross-thread shard locking caused **False Sharing**, where writing to one core invalidated the CPU caches of others.
 * **The Solution:** Fragmented the engine so each Reactor thread owns its private data partition. This removed all mutexes from the hot path.
 
-### Phase 7: Distributed Steering (Current)
+### Phase 7: Distributed Steering
 
 * **Consistency Logic:** Implemented an **ITC (Inter-Thread Communication) Bus** using SPSC (Single-Producer Single-Consumer) queues to "steer" requests.
 * **The "Hop":** If Reactor A accepts a connection for a key owned by Reactor B, it asynchronously "hops" the request to Core B's inbox via `eventfd` signaling.
+
+### Phase 8: Async Batched AOF (Current)
+
+* **The Problem:** The previous AOF gated every `SET` response on its own synchronous write completing, and remote (hopped) SETs used a blocking `write()` syscall on the reactor hot path — capping pipelined SET throughput at ~1M ops/sec.
+* **The Solution:** Each reactor coalesces all SETs into a per-core in-memory buffer and flushes it as **one batched, fire-and-forget `io_uring` write per event-loop iteration** (double-buffered for write-lifetime safety). Client responses are no longer gated on persistence.
+* **The Result:** Pipelined SET throughput roughly **doubled (≈1M → ≈2M ops/sec)** and the mixed 1:1 workload reached **2.14M ops/sec**, at the cost of a small async-durability window (a crash can lose the most recent, not-yet-flushed writes — the Redis `appendfsync no` tradeoff).
 
 ---
 
@@ -77,7 +84,7 @@ To prevent race conditions during asynchronous hopping, each connection carries 
 
 ---
 
-## 🚀 Benchmarking (Phase 7)
+## 🚀 Benchmarking (Phase 8)
 
 Verified via `memtier_benchmark` with 8 threads and 200 concurrent connections:
 
@@ -92,9 +99,9 @@ memtier_benchmark -s 127.0.0.1 -p 6379 --protocol=redis --clients=200 --threads=
 
 **Verified Results:**
 
-* **Total Throughput:** 365,825 Ops/sec
-* **Avg Latency:** 0.21 ms
-* **p99 Latency:** 0.79 ms
+* **Total Throughput:** 2,140,143 Ops/sec
+* **Avg Latency:** 11.95 ms
+* **p99 Latency:** 34.05 ms
 * **Consistency:** 100% (Zero architectural misses across all 8 cores)
 
 ---

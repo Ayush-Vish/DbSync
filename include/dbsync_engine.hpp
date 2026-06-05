@@ -93,6 +93,33 @@ public:
 public:
     int aof_fd = -1;
 
+    // ===== Async AOF (batched, non-blocking) =====
+    // SETs are encoded into `aof_active` as they happen. Once per reactor loop
+    // the active buffer is swapped into `aof_flush` and submitted to io_uring as
+    // a single write; client responses are NOT gated on this completing.
+    std::string aof_active;   // accumulates encoded SETs between flushes
+    std::string aof_flush;    // buffer currently handed to io_uring (in-flight)
+    bool aof_in_flight = false;
+
+    // Append a SET to the in-memory AOF buffer in RESP format:
+    // *3\r\n$3\r\nSET\r\n$<klen>\r\n<key>\r\n$<vlen>\r\n<value>\r\n
+    // Builds directly (no fixed-size temp), so arbitrarily large values are safe.
+    void append_aof_set(std::string_view key, std::string_view value) {
+        if (aof_fd < 0) return;
+        char num[20];
+        aof_active.append("*3\r\n$3\r\nSET\r\n$");
+        auto k = std::to_chars(num, num + sizeof(num), key.size());
+        aof_active.append(num, k.ptr - num);
+        aof_active.append("\r\n");
+        aof_active.append(key.data(), key.size());
+        aof_active.append("\r\n$");
+        auto v = std::to_chars(num, num + sizeof(num), value.size());
+        aof_active.append(num, v.ptr - num);
+        aof_active.append("\r\n");
+        aof_active.append(value.data(), value.size());
+        aof_active.append("\r\n");
+    }
+
     // Constructor with global shard partitioning
     // shards_per_reactor: number of shards this reactor manages locally
     // reactor_id: this reactor's ID (0 to num_reactors-1)
@@ -118,6 +145,9 @@ public:
             aof_fd = open(file_name.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_NOATIME, 0644);
             if (aof_fd < 0) {
                 perror("Failed to open AOF for writing");
+            } else {
+                aof_active.reserve(64 * 1024);
+                aof_flush.reserve(64 * 1024);
             }
         }
     }

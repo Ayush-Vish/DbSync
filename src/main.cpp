@@ -118,6 +118,14 @@ void run_reactor(int reactor_id, int physical_core_id)
     
     submit_itc_read();
 
+    // Dedicated sentinel connection used to identify batched AOF flush
+    // completions. It is never released back to the pool.
+    Connection* aof_conn = conn_pool.acquire();
+    if (aof_conn) {
+        aof_conn->fd = engine.aof_fd;
+        aof_conn->type = OpType::AOF_WRITE;
+    }
+
     // Use resp::bulk from command_handler.hpp for formatting
 
     // Helper to submit response when connection is ready
@@ -174,17 +182,10 @@ void run_reactor(int reactor_id, int physical_core_id)
             else if (msg.type == ITCMessage::Type::SET_REQ) {
                 // Process SET request from another reactor
                 process_local_set(engine, msg.get_key(), msg.get_value(), msg.ttl_ms);
-                
-                // Write to AOF for remote SETs
-                if (engine.aof_fd >= 0) {
-                    char aof_buf[1024];
-                    int aof_len = snprintf(aof_buf, sizeof(aof_buf),
-                        "*3\r\n$3\r\nSET\r\n$%u\r\n%.*s\r\n$%u\r\n%.*s\r\n",
-                        (unsigned)msg.key_len, (int)msg.key_len, msg.key,
-                        (unsigned)msg.value_len, (int)msg.value_len, msg.value);
-                    [[maybe_unused]] auto _ = write(engine.aof_fd, aof_buf, aof_len);
-                }
-                
+
+                // Queue SET into the async AOF buffer (flushed in batch below)
+                engine.append_aof_set(msg.get_key(), msg.get_value());
+
                 ITCMessage resp;
                 resp.type = ITCMessage::Type::RESP;
                 resp.sender_reactor = reactor_id;
@@ -237,6 +238,20 @@ void run_reactor(int reactor_id, int physical_core_id)
         }
 
         // ========== PHASE 2: IO Processing ==========
+        // Flush all SETs accumulated this iteration as ONE batched, non-blocking
+        // write. Responses are never gated on this; durability is best-effort
+        // within the in-flight window (async AOF).
+        if (aof_conn && !engine.aof_in_flight && !engine.aof_active.empty()) {
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+            if (sqe) {
+                std::swap(engine.aof_active, engine.aof_flush);
+                engine.aof_in_flight = true;
+                io_uring_prep_write(sqe, engine.aof_fd,
+                                    engine.aof_flush.data(), engine.aof_flush.size(), -1);
+                io_uring_sqe_set_data(sqe, aof_conn);
+            }
+        }
+
         struct io_uring_cqe *cqe;
         io_uring_submit(&ring);
         if (io_uring_wait_cqe(&ring, &cqe) < 0)
@@ -245,13 +260,35 @@ void run_reactor(int reactor_id, int physical_core_id)
         Connection *conn = (Connection *)io_uring_cqe_get_data(cqe);
         int res = cqe->res;
 
-        // Handle AOF_WRITE errors first (before generic res < 0 cleanup)
-        if (conn->type == OpType::AOF_WRITE && res < 0)
+        // Batched AOF flush completion — decoupled from any client connection.
+        if (conn->type == OpType::AOF_WRITE)
         {
-            // AOF write failed - log and cleanup connection
-            fd_to_conn.erase(conn->fd);
-            close(conn->fd);
-            conn_pool.release(conn);
+            if (res < 0)
+            {
+                // Flush failed: drop this batch and keep serving. The acked
+                // SETs in this window are lost (async durability tradeoff).
+                engine.aof_flush.clear();
+                engine.aof_in_flight = false;
+            }
+            else if ((size_t)res < engine.aof_flush.size())
+            {
+                // Partial write: keep the unwritten remainder and resubmit it.
+                engine.aof_flush.erase(0, res);
+                struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+                if (sqe) {
+                    io_uring_prep_write(sqe, engine.aof_fd,
+                                        engine.aof_flush.data(), engine.aof_flush.size(), -1);
+                    io_uring_sqe_set_data(sqe, aof_conn);
+                    // stays in_flight until the remainder lands
+                } else {
+                    engine.aof_in_flight = false; // retry on next iteration
+                }
+            }
+            else
+            {
+                engine.aof_flush.clear();
+                engine.aof_in_flight = false;
+            }
         }
         else if (res < 0)
         {
@@ -295,7 +332,6 @@ void run_reactor(int reactor_id, int physical_core_id)
                 conn->response_data.clear();
                 conn->pipeline_results.clear();
                 conn->pending_itc = 0;
-                bool has_set_command = false;
                 int cmd_idx = 0;
                 uint64_t remote_signal_mask = 0;
 
@@ -321,15 +357,9 @@ void run_reactor(int reactor_id, int physical_core_id)
 
                         if (is_local) {
                             engine.set(cmd.args[0], cmd.args[1], ttl_ms);
-                            
-                            // Prepare AOF
-                            conn->aof_len = snprintf(
-                                conn->aof_buf, sizeof(conn->aof_buf),
-                                "*3\r\n$3\r\nSET\r\n$%zu\r\n%.*s\r\n$%zu\r\n%.*s\r\n",
-                                cmd.args[0].size(), (int)cmd.args[0].size(), cmd.args[0].data(),
-                                cmd.args[1].size(), (int)cmd.args[1].size(), cmd.args[1].data());
-                            
-                            has_set_command = true;
+                            // Queue every SET (fixes the pipeline overwrite bug);
+                            // flushed as one batched async write below.
+                            engine.append_aof_set(cmd.args[0], cmd.args[1]);
                             conn->pipeline_results.push_back(std::string(resp::OK));
                         } else {
                             // Forward SET to owner reactor via ITC
@@ -410,27 +440,9 @@ void run_reactor(int reactor_id, int physical_core_id)
                     }
                 }
 
-                if (has_set_command && conn->aof_len > 0 && conn->pending_itc == 0)
-                {
-                    // Write to AOF first (only if no pending ITC)
-                    conn->type = OpType::AOF_WRITE;
-                    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-                    io_uring_prep_write(sqe, engine.aof_fd, conn->aof_buf, conn->aof_len, -1);
-                    sqe->flags |= IOSQE_ASYNC;
-                    io_uring_sqe_set_data(sqe, conn);
-                }
-                else
-                {
-                    submit_response(conn);
-                }
+                // AOF persistence is decoupled (batched + async); respond now.
+                submit_response(conn);
             }
-        }
-        else if (conn->type == OpType::AOF_WRITE)
-        {
-            conn->aof_len = 0;
-            
-            // Now send response to client
-            submit_response(conn);
         }
         else if (conn->type == OpType::WRITE)
         {
